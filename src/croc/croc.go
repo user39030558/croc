@@ -2971,10 +2971,25 @@ func (c *Client) processMessage(payload []byte, attempt *transferAttemptState) (
 		if err != nil {
 			return
 		}
-		c.peerReconnectVersion = remoteFile.ReconnectVersion
-		c.peerPerFileCompression = supportsFeature(remoteFile.Features, perFileCompressionFeature)
-		c.peerParallelFiles = supportsFeature(remoteFile.Features, parallelFilesFeature)
-		c.peerHybridChunks = supportsFeature(remoteFile.Features, hybridChunksFeature)
+		requestedPerFileCompression := supportsFeature(remoteFile.Features, perFileCompressionFeature)
+		requestedParallelFiles := supportsFeature(remoteFile.Features, parallelFilesFeature)
+		requestedHybridChunks := supportsFeature(remoteFile.Features, hybridChunksFeature)
+		c.fileTransferMu.Lock()
+		parallelStarted := c.parallelFileMode
+		if !parallelStarted {
+			c.peerReconnectVersion = remoteFile.ReconnectVersion
+			c.peerPerFileCompression = requestedPerFileCompression
+			c.peerParallelFiles = requestedParallelFiles
+			c.peerHybridChunks = requestedHybridChunks
+		}
+		featureMismatch := parallelStarted &&
+			(c.peerPerFileCompression != requestedPerFileCompression ||
+				c.peerParallelFiles != requestedParallelFiles ||
+				c.peerHybridChunks != requestedHybridChunks)
+		c.fileTransferMu.Unlock()
+		if featureMismatch {
+			return false, fmt.Errorf("parallel file request changed negotiated features")
+		}
 
 		if c.Options.Ask && !c.senderAskDone {
 			output, colorEnabled := termui.Output(os.Stderr)

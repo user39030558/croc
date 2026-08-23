@@ -60,6 +60,8 @@ jobs:
 
       - name: Race-test parallel file and hybrid chunk scheduling
         run: go test -race ./src/croc -run 'Test(FileIndexQueueConcurrentPop|CrocParallelSmallFiles|CrocHybridChunksUseMultipleLanesPerFile|SendCollectFilesHashesConcurrently)'
+        env:
+          LOGGER: warn
 
   security-fuzz-smoke:
     name: Security fuzz smoke tests
