@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 	"unicode/utf8"
@@ -167,6 +168,122 @@ func TestParallelFilesRequireMultipleFilesAndConnections(t *testing.T) {
 	assert.False(t, client.parallelFilesEnabled())
 }
 
+func TestSplitParallelFileJobsCoversEachChunkOnce(t *testing.T) {
+	chunkSize := int64(models.TCP_BUFFER_SIZE / 2)
+	fileSize := 11*chunkSize - 7
+	ranges := []int64{chunkSize, 0, 3, 5 * chunkSize, 6}
+	jobs := splitParallelFileJobs(9, ranges, fileSize, 3*chunkSize)
+	if len(jobs) != 3 {
+		t.Fatalf("split produced %d jobs, want 3", len(jobs))
+	}
+	want := utils.ChunkRangesToChunks(ranges)
+	var got []int64
+	for _, job := range jobs {
+		if job.fileIndex != 9 {
+			t.Fatalf("job file index = %d, want 9", job.fileIndex)
+		}
+		if len(job.chunkRanges) < 3 {
+			t.Fatalf("job has no explicit ranges: %v", job.chunkRanges)
+		}
+		if err := validateParallelChunkRanges(job.chunkRanges, fileSize); err != nil {
+			t.Fatalf("job ranges are invalid: %v", err)
+		}
+		if count := utils.ChunkRangesCount(job.chunkRanges, fileSize, chunkSize); count > 3 {
+			t.Fatalf("job contains %d chunks, want at most 3", count)
+		}
+		got = append(got, utils.ChunkRangesToChunks(job.chunkRanges)...)
+	}
+	assert.Equal(t, want, got)
+
+	fullJobs := splitParallelFileJobs(4, nil, fileSize, 4*chunkSize)
+	var fullChunks []int64
+	for _, job := range fullJobs {
+		fullChunks = append(fullChunks, utils.ChunkRangesToChunks(job.chunkRanges)...)
+	}
+	if len(fullChunks) != utils.ChunkRangesCount(nil, fileSize, chunkSize) {
+		t.Fatalf("full split covers %d chunks, want %d", len(fullChunks), utils.ChunkRangesCount(nil, fileSize, chunkSize))
+	}
+	for index, position := range fullChunks {
+		if position != int64(index)*chunkSize {
+			t.Fatalf("full split chunk %d = %d", index, position)
+		}
+	}
+	if err := validateParallelChunkRanges([]int64{chunkSize, 0, 2, chunkSize, 1}, fileSize); err == nil {
+		t.Fatal("overlapping ranges should be rejected")
+	}
+}
+
+func TestParallelLaneAckWireRoundTrip(t *testing.T) {
+	encoded, err := encodeParallelLaneAck(17, 3, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ack, hasLane, err := decodeParallelLaneAck(message.Message{Num: 17, Bytes: encoded})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assert.True(t, hasLane)
+	assert.Equal(t, parallelFileLaneAck{FileIndex: 17, DataConnectionIndex: 3, FileComplete: true}, ack)
+
+	legacy, hasLane, err := decodeParallelLaneAck(message.Message{Num: 8})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assert.False(t, hasLane)
+	assert.Equal(t, 8, legacy.FileIndex)
+}
+
+func TestHashWorkerCountIsBoundedAndConfigurable(t *testing.T) {
+	t.Setenv("CROC_HASH_WORKERS", "3")
+	files := make([]FileInfo, 10)
+	assert.Equal(t, 3, hashWorkerCount(files))
+	t.Setenv("CROC_HASH_WORKERS", "99")
+	assert.Equal(t, 10, hashWorkerCount(files))
+	assert.Equal(t, 0, hashWorkerCount(nil))
+}
+
+func TestSendCollectFilesHashesConcurrently(t *testing.T) {
+	t.Setenv("CROC_HASH_WORKERS", "3")
+	directory := t.TempDir()
+	files := make([]FileInfo, 6)
+	for index := range files {
+		name := fmt.Sprintf("hash-%d.bin", index)
+		if err := os.WriteFile(filepath.Join(directory, name), []byte{byte(index + 1)}, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		files[index] = FileInfo{
+			Name:         name,
+			FolderSource: directory,
+			Size:         1,
+			Mode:         0o600,
+		}
+	}
+	var active atomic.Int32
+	var peak atomic.Int32
+	client := &Client{
+		Options: Options{HashAlgorithm: "xxhash", NoCompress: true},
+		stop:    newStop(nil),
+	}
+	client.stop.hash = func(string, string, ...bool) ([]byte, error) {
+		current := active.Add(1)
+		for {
+			previous := peak.Load()
+			if current <= previous || peak.CompareAndSwap(previous, current) {
+				break
+			}
+		}
+		time.Sleep(25 * time.Millisecond)
+		active.Add(-1)
+		return []byte{1}, nil
+	}
+	if err := client.sendCollectFiles(files); err != nil {
+		t.Fatal(err)
+	}
+	if got := peak.Load(); got < 2 || got > 3 {
+		t.Fatalf("peak concurrent hashes = %d, want 2..3", got)
+	}
+}
+
 func TestCrocParallelSmallFiles(t *testing.T) {
 	testDir := t.TempDir()
 	sourceDir := filepath.Join(testDir, "source")
@@ -239,6 +356,99 @@ func TestCrocParallelSmallFiles(t *testing.T) {
 		}
 		if !bytes.Equal(actual, expected) {
 			t.Fatalf("received contents differ for %s", name)
+		}
+	}
+}
+
+func TestCrocHybridChunksUseMultipleLanesPerFile(t *testing.T) {
+	originalTarget := hybridChunkJobTargetBytes
+	hybridChunkJobTargetBytes = 256 << 10
+	t.Cleanup(func() { hybridChunkJobTargetBytes = originalTarget })
+
+	testDir := t.TempDir()
+	sourceDir := filepath.Join(testDir, "source")
+	receiveDir := filepath.Join(testDir, "receive")
+	if err := os.MkdirAll(sourceDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(receiveDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	large := make([]byte, 2<<20+123)
+	for index := range large {
+		large[index] = byte((index*31 + 7) % 251)
+	}
+	want := map[string][]byte{
+		"large.bin": large,
+		"tail.txt":  bytes.Repeat([]byte("tail-data"), 8192),
+	}
+	partialLarge := make([]byte, len(large))
+	copy(partialLarge[:1<<20], large[:1<<20])
+	if err := os.WriteFile(filepath.Join(receiveDir, "large.bin"), partialLarge, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	paths := make([]string, 0, len(want))
+	for name, contents := range want {
+		filename := filepath.Join(sourceDir, name)
+		if err := os.WriteFile(filename, contents, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		paths = append(paths, filename)
+	}
+	files, emptyFolders, folderCount, err := GetFilesInfo(paths, false, false, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if jobs := splitParallelFileJobs(0, nil, int64(len(large)), hybridChunkJobTargetBytes); len(jobs) < 4 {
+		t.Fatalf("test file split into only %d jobs", len(jobs))
+	}
+	originalCwd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(receiveDir); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(originalCwd) })
+
+	secret := fmt.Sprintf("hybrid-chunks-%d", time.Now().UnixNano())
+	sender, err := New(Options{
+		IsSender: true, SharedSecret: secret, RelayAddress: "127.0.0.1:8281",
+		RelayPorts: []string{"8281"}, RelayPassword: "pass123", NoPrompt: true,
+		DisableLocal: true, Curve: "siec", Overwrite: true, NoCompress: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	receiver, err := New(Options{
+		SharedSecret: secret, RelayAddress: "127.0.0.1:8281", RelayPassword: "pass123",
+		NoPrompt: true, DisableLocal: true, Curve: "siec", Overwrite: true, NoCompress: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	errors := make(chan error, 2)
+	go func() { errors <- sender.Send(files, emptyFolders, folderCount) }()
+	time.Sleep(100 * time.Millisecond)
+	go func() { errors <- receiver.Receive() }()
+	for range 2 {
+		if err := <-errors; err != nil {
+			t.Fatalf("hybrid transfer failed: %v", err)
+		}
+	}
+	if !sender.hybridFileMode || !receiver.hybridFileMode {
+		t.Fatal("both peers should negotiate hybrid chunk mode")
+	}
+	if len(sender.FilesHasFinished) != len(paths) || len(receiver.FilesHasFinished) != len(paths) {
+		t.Fatalf("finished files sender=%d receiver=%d, want %d", len(sender.FilesHasFinished), len(receiver.FilesHasFinished), len(paths))
+	}
+	for name, expected := range want {
+		actual, err := os.ReadFile(filepath.Join(receiveDir, name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(actual, expected) {
+			t.Fatalf("received hybrid contents differ for %s", name)
 		}
 	}
 }

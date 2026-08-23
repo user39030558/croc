@@ -70,6 +70,7 @@ func (c *Client) newProgressBar(max int64, description string, throttle time.Dur
 		progressbar.OptionSetWriter(progressBarWriter(output, colorEnabled)),
 		progressbar.OptionSetVisibility(!c.Options.SendingText),
 		progressbar.OptionEnableColorCodes(colorEnabled),
+		progressbar.OptionUseANSICodes(colorEnabled),
 		progressbar.OptionSetTheme(progressBarTheme(colorEnabled)),
 	}
 	if throttle > 0 {
@@ -92,8 +93,9 @@ func (c *Client) newAggregateProgressBar(max int64, description string) *progres
 		progressbar.OptionSetWriter(progressBarWriter(output, colorEnabled)),
 		progressbar.OptionSetVisibility(!c.Options.SendingText),
 		progressbar.OptionEnableColorCodes(colorEnabled),
+		progressbar.OptionUseANSICodes(colorEnabled),
 		progressbar.OptionSetTheme(progressBarTheme(colorEnabled)),
-		progressbar.OptionThrottle(150 * time.Millisecond),
+		progressbar.OptionThrottle(500 * time.Millisecond),
 	}
 	return progressbar.NewOptions64(max, options...)
 }

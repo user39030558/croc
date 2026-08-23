@@ -28,7 +28,113 @@ import (
 	"github.com/schollz/croc/v11/src/utils"
 )
 
-const aggregateProgressFileThreshold = 32
+const (
+	aggregateProgressFileThreshold = 32
+)
+
+var hybridChunkJobTargetBytes = int64(64 << 20)
+
+func splitParallelFileJobs(fileIndex int, chunkRanges []int64, fileSize, targetBytes int64) []parallelFileJob {
+	const defaultChunkSize = int64(models.TCP_BUFFER_SIZE / 2)
+	if fileSize <= 0 {
+		return nil
+	}
+	chunkSize := defaultChunkSize
+	if len(chunkRanges) > 0 && chunkRanges[0] > 0 {
+		chunkSize = chunkRanges[0]
+	}
+	if targetBytes < chunkSize {
+		targetBytes = chunkSize
+	}
+	targetChunks := targetBytes / chunkSize
+	if targetChunks < 1 {
+		targetChunks = 1
+	}
+
+	ranges := chunkRanges
+	if len(ranges) == 0 {
+		ranges = []int64{chunkSize, 0, (fileSize + chunkSize - 1) / chunkSize}
+	}
+	jobs := make([]parallelFileJob, 0, int64(utils.ChunkRangesCount(ranges, fileSize, chunkSize))/targetChunks+1)
+	current := []int64{chunkSize}
+	var currentChunks int64
+	flush := func() {
+		if currentChunks == 0 {
+			return
+		}
+		jobs = append(jobs, parallelFileJob{fileIndex: fileIndex, chunkRanges: current})
+		current = []int64{chunkSize}
+		currentChunks = 0
+	}
+	for index := 1; index+1 < len(ranges); index += 2 {
+		start, count := ranges[index], ranges[index+1]
+		for count > 0 {
+			capacity := targetChunks - currentChunks
+			if capacity == 0 {
+				flush()
+				capacity = targetChunks
+			}
+			take := count
+			if take > capacity {
+				take = capacity
+			}
+			current = append(current, start, take)
+			currentChunks += take
+			start += take * chunkSize
+			count -= take
+			if currentChunks == targetChunks {
+				flush()
+			}
+		}
+	}
+	flush()
+	return jobs
+}
+
+func encodeParallelLaneAck(fileIndex, connectionIndex int, fileComplete bool) ([]byte, error) {
+	return json.Marshal(parallelFileLaneAck{
+		FileIndex:           fileIndex,
+		DataConnectionIndex: connectionIndex,
+		FileComplete:        fileComplete,
+	})
+}
+
+func decodeParallelLaneAck(m message.Message) (parallelFileLaneAck, bool, error) {
+	if len(m.Bytes) == 0 {
+		return parallelFileLaneAck{FileIndex: m.Num}, false, nil
+	}
+	var ack parallelFileLaneAck
+	if err := json.Unmarshal(m.Bytes, &ack); err != nil {
+		return parallelFileLaneAck{}, true, err
+	}
+	if ack.FileIndex != m.Num {
+		return parallelFileLaneAck{}, true, fmt.Errorf("parallel lane acknowledgement file mismatch: %d != %d", ack.FileIndex, m.Num)
+	}
+	return ack, true, nil
+}
+
+func validateParallelChunkRanges(ranges []int64, fileSize int64) error {
+	if len(ranges) == 0 {
+		return nil
+	}
+	chunkSize := int64(models.TCP_BUFFER_SIZE / 2)
+	if len(ranges) < 3 || len(ranges)%2 == 0 || ranges[0] != chunkSize {
+		return fmt.Errorf("invalid parallel chunk-range header")
+	}
+	var previousLastStart int64
+	for index := 1; index+1 < len(ranges); index += 2 {
+		start, count := ranges[index], ranges[index+1]
+		if start < 0 || start >= fileSize || start%chunkSize != 0 || count <= 0 {
+			return fmt.Errorf("invalid parallel chunk range at index %d", index)
+		}
+		maxCount := (fileSize-start-1)/chunkSize + 1
+		if count > maxCount || (index > 1 && start <= previousLastStart) {
+			return fmt.Errorf("parallel chunk range exceeds or overlaps file at index %d", index)
+		}
+		previousLastStart = start + (count-1)*chunkSize
+	}
+	return nil
+}
 
 type parallelProgressFile struct {
 	index int
@@ -47,7 +153,7 @@ func newParallelFileVerifier(chunkRanges []int64, fileSize int64, algorithm stri
 }
 
 func (c *Client) parallelAggregateProgress() bool {
-	return len(c.FilesToTransfer) > aggregateProgressFileThreshold
+	return c.hybridFileMode || len(c.FilesToTransfer) > aggregateProgressFileThreshold
 }
 
 func shortParallelProgressName(name string) string {
@@ -214,17 +320,35 @@ func (c *Client) parallelFilesEnabled() bool {
 func (c *Client) closeParallelFileStates() {
 	c.fileTransferMu.Lock()
 	states := make([]*fileTransferState, 0, len(c.receiveTransfers)+len(c.senderTransfers))
+	receiveFiles := make([]*parallelReceiveFileState, 0, len(c.receiveFileStates))
 	for _, state := range c.receiveTransfers {
 		states = append(states, state)
+	}
+	for _, state := range c.receiveFileStates {
+		receiveFiles = append(receiveFiles, state)
 	}
 	for _, state := range c.senderTransfers {
 		states = append(states, state)
 	}
 	c.receiveTransfers = make(map[int]*fileTransferState)
+	c.receiveFileStates = make(map[int]*parallelReceiveFileState)
 	c.senderTransfers = make(map[int]*fileTransferState)
 	c.fileTransferMu.Unlock()
 	c.clearParallelActiveFiles()
 	for _, state := range states {
+		state.mu.Lock()
+		if state.file == nil || state.closed || state.receiveFile != nil {
+			state.mu.Unlock()
+			continue
+		}
+		state.closed = true
+		err := state.file.Close()
+		state.mu.Unlock()
+		if err != nil && !errors.Is(err, os.ErrClosed) {
+			log.Tracef("closing parallel transfer file: %v", err)
+		}
+	}
+	for _, state := range receiveFiles {
 		state.mu.Lock()
 		if state.file == nil || state.closed {
 			state.mu.Unlock()
@@ -234,7 +358,7 @@ func (c *Client) closeParallelFileStates() {
 		err := state.file.Close()
 		state.mu.Unlock()
 		if err != nil && !errors.Is(err, os.ErrClosed) {
-			log.Tracef("closing parallel transfer file: %v", err)
+			log.Tracef("closing hybrid receive file: %v", err)
 		}
 	}
 }
@@ -370,11 +494,19 @@ func (c *Client) initializeParallelFileTransfers() error {
 		}
 	}
 	c.fileQueue.reset(pending)
+	if c.peerHybridChunks {
+		c.fileTransferMu.Lock()
+		c.hybridFileMode = true
+		c.fileTransferMu.Unlock()
+	}
 	c.initializeParallelProgress(pending)
 	c.Step3RecipientRequestFile = true
 	c.markTransferStarted()
 	if len(pending) == 0 {
 		return c.finishParallelReceiverIfDone()
+	}
+	if c.peerHybridChunks {
+		return c.initializeHybridFileTransfers(pending)
 	}
 	workers := len(c.Options.RelayPorts)
 	if workers > len(pending) {
@@ -386,6 +518,118 @@ func (c *Client) initializeParallelFileTransfers() error {
 		}
 	}
 	return nil
+}
+
+func (c *Client) initializeHybridFileTransfers(pending []int) error {
+	jobs := make([]parallelFileJob, 0, len(pending))
+	var transferMax int64
+	for _, fileIndex := range pending {
+		base, err := c.recipientInitializeFileState(fileIndex)
+		if err != nil {
+			return err
+		}
+		fileJobs := splitParallelFileJobs(
+			fileIndex,
+			base.chunkRanges,
+			c.FilesToTransfer[fileIndex].Size,
+			hybridChunkJobTargetBytes,
+		)
+		if len(fileJobs) == 0 {
+			_ = base.file.Close()
+			return fmt.Errorf("file %d produced no hybrid transfer jobs", fileIndex)
+		}
+		bar := c.makeFileBar(fileIndex, base.chunkRanges)
+		verifier := base.verifier
+		if len(fileJobs) > 1 {
+			verifier = nil
+		}
+		fileState := &parallelReceiveFileState{
+			fileIndex:       fileIndex,
+			path:            base.path,
+			file:            base.file,
+			bar:             bar,
+			chunkRanges:     append([]int64(nil), base.chunkRanges...),
+			bytesToTransfer: utils.ChunkRangesBytes(base.chunkRanges, c.FilesToTransfer[fileIndex].Size, models.TCP_BUFFER_SIZE/2),
+			chunksRemaining: base.chunkCount,
+			jobsRemaining:   len(fileJobs),
+			verifier:        verifier,
+		}
+		c.fileTransferMu.Lock()
+		c.receiveFileStates[fileIndex] = fileState
+		c.fileTransferMu.Unlock()
+		transferMax += c.FilesToTransfer[fileIndex].Size
+		jobs = append(jobs, fileJobs...)
+	}
+	c.hybridTransferMax = transferMax
+	c.hybridQueue.reset(jobs)
+	return c.scheduleHybridReceiverConnections()
+}
+
+func (c *Client) scheduleHybridReceiverConnections() error {
+	workers := len(c.Options.RelayPorts)
+	for connectionIndex := 0; connectionIndex < workers; connectionIndex++ {
+		c.fileTransferMu.Lock()
+		_, busy := c.receiveTransfers[connectionIndex]
+		c.fileTransferMu.Unlock()
+		if busy {
+			continue
+		}
+		job, ok := c.hybridQueue.pop()
+		if !ok {
+			break
+		}
+		if err := c.startHybridReceiverJob(connectionIndex, job); err != nil {
+			return err
+		}
+	}
+	return c.finishParallelReceiverIfDone()
+}
+
+func (c *Client) startHybridReceiverJob(connectionIndex int, job parallelFileJob) error {
+	c.fileTransferMu.Lock()
+	fileState := c.receiveFileStates[job.fileIndex]
+	if fileState == nil {
+		c.fileTransferMu.Unlock()
+		return fmt.Errorf("hybrid transfer file %d is not active", job.fileIndex)
+	}
+	if _, busy := c.receiveTransfers[connectionIndex]; busy {
+		c.fileTransferMu.Unlock()
+		return fmt.Errorf("data connection %d already has a file lane", connectionIndex)
+	}
+	state := &fileTransferState{
+		fileIndex:           job.fileIndex,
+		dataConnectionIndex: connectionIndex,
+		path:                fileState.path,
+		chunkRanges:         append([]int64(nil), job.chunkRanges...),
+		chunkCount: utils.ChunkRangesCount(
+			job.chunkRanges,
+			c.FilesToTransfer[job.fileIndex].Size,
+			models.TCP_BUFFER_SIZE/2,
+		),
+		bar:               fileState.bar,
+		receiveFile:       fileState,
+		receivedPositions: make(map[int64]struct{}),
+	}
+	c.receiveTransfers[connectionIndex] = state
+	c.fileTransferMu.Unlock()
+	c.setParallelActiveFile(connectionIndex, job.fileIndex)
+
+	machineID, _ := machineid.ID()
+	request, err := json.Marshal(RemoteFileRequest{
+		CurrentFileChunkRanges:    state.chunkRanges,
+		FilesToTransferCurrentNum: job.fileIndex,
+		DataConnectionIndex:       connectionIndex,
+		FileTransferBytes:         fileState.bytesToTransfer,
+		TransferTotalBytes:        c.hybridTransferMax,
+		MachineID:                 machineID,
+		ReconnectVersion:          c.reconnectVersion,
+		Features:                  []string{perFileCompressionFeature, parallelFilesFeature, hybridChunksFeature},
+	})
+	if err != nil {
+		return err
+	}
+	log.Debugf("requesting hybrid file %d lane %d with %d chunks", job.fileIndex, connectionIndex, state.chunkCount)
+	return c.sendControl(message.Message{Type: message.TypeRecipientReady, Bytes: request})
 }
 
 func (c *Client) makeFileBar(index int, chunkRanges []int64) *progressbar.ProgressBar {
@@ -414,6 +658,36 @@ func (c *Client) makeFileBar(index int, chunkRanges []int64) *progressbar.Progre
 	}
 	c.progressMu.Unlock()
 	return bar
+}
+
+func (c *Client) makeHybridSenderBar(index int, fileTransferBytes, transferTotalBytes int64) *progressbar.ProgressBar {
+	c.progressMu.Lock()
+	defer c.progressMu.Unlock()
+	if transferTotalBytes <= 0 {
+		for _, fileInfo := range c.FilesToTransfer {
+			transferTotalBytes += fileInfo.Size
+		}
+	}
+	if transferTotalBytes <= 0 {
+		transferTotalBytes = 1
+	}
+	if c.parallelBar == nil {
+		c.parallelBar = c.newAggregateProgressBar(
+			transferTotalBytes,
+			fmt.Sprintf("Transferring %d files", len(c.FilesToTransfer)),
+		)
+		c.parallelDirty = true
+	}
+	if c.senderProgressFile == nil {
+		c.senderProgressFile = make(map[int]struct{})
+	}
+	if _, initialized := c.senderProgressFile[index]; !initialized {
+		c.senderProgressFile[index] = struct{}{}
+		if resumedBytes := c.FilesToTransfer[index].Size - fileTransferBytes; resumedBytes > 0 {
+			_ = c.parallelBar.Add64(resumedBytes)
+		}
+	}
+	return c.parallelBar
 }
 
 func (c *Client) startParallelReceiverFile(connectionIndex int) error {
@@ -454,11 +728,16 @@ func (c *Client) startParallelReceiverFile(connectionIndex int) error {
 }
 
 func (c *Client) finishParallelReceiverIfDone() error {
-	if c.fileQueue.hasPending() {
+	c.fileTransferMu.Lock()
+	hybrid := c.hybridFileMode
+	c.fileTransferMu.Unlock()
+	if (hybrid && c.hybridQueue.hasPending()) || (!hybrid && c.fileQueue.hasPending()) {
 		return nil
 	}
 	c.fileTransferMu.Lock()
-	done := len(c.receiveTransfers) == 0 && !c.SuccessfulTransfer
+	done := len(c.receiveTransfers) == 0 &&
+		(!hybrid || len(c.receiveFileStates) == 0) &&
+		!c.SuccessfulTransfer
 	if done {
 		c.SuccessfulTransfer = true
 	}
@@ -499,6 +778,9 @@ func hashOpenFile(file *os.File, size int64, algorithm string) ([]byte, error) {
 func (c *Client) receiveParallelData(state *fileTransferState, data []byte) (bool, error) {
 	if state == nil {
 		return false, fmt.Errorf("received data on an idle parallel-file connection")
+	}
+	if state.receiveFile != nil {
+		return c.receiveHybridParallelData(state, data)
 	}
 	if len(data) < 8 {
 		return false, fmt.Errorf("parallel-file data frame is too short: %d bytes", len(data))
@@ -581,7 +863,162 @@ func (c *Client) receiveParallelData(state *fileTransferState, data []byte) (boo
 	return true, nil
 }
 
-func (c *Client) finishParallelReceiverFile(fileIndex int) error {
+func (c *Client) receiveHybridParallelData(state *fileTransferState, data []byte) (bool, error) {
+	if len(data) < 8 {
+		return false, fmt.Errorf("hybrid-file data frame is too short: %d bytes", len(data))
+	}
+	state.mu.Lock()
+	if state.closed {
+		state.mu.Unlock()
+		return false, fmt.Errorf("received data on a completed hybrid-file lane")
+	}
+	position := int64(binary.LittleEndian.Uint64(data[:8]))
+	payload := data[8:]
+	fileSize := c.FilesToTransfer[state.fileIndex].Size
+	chunkSize := int64(models.TCP_BUFFER_SIZE / 2)
+	if position < 0 || position >= fileSize || position%chunkSize != 0 ||
+		int64(len(payload)) > fileSize-position ||
+		!utils.ChunkRangesContain(state.chunkRanges, position) {
+		state.mu.Unlock()
+		return false, fmt.Errorf("invalid hybrid data range for file %d: offset %d, length %d", state.fileIndex, position, len(payload))
+	}
+	expectedBytes := chunkSize
+	if remaining := fileSize - position; remaining < expectedBytes {
+		expectedBytes = remaining
+	}
+	if int64(len(payload)) != expectedBytes {
+		state.mu.Unlock()
+		return false, fmt.Errorf("invalid hybrid chunk length for file %d at %d: %d != %d", state.fileIndex, position, len(payload), expectedBytes)
+	}
+	if _, duplicate := state.receivedPositions[position]; duplicate {
+		state.mu.Unlock()
+		return false, fmt.Errorf("duplicate hybrid chunk for file %d at %d", state.fileIndex, position)
+	}
+	if _, err := state.receiveFile.file.WriteAt(payload, position); err != nil {
+		state.mu.Unlock()
+		return false, err
+	}
+	state.receivedPositions[position] = struct{}{}
+	state.totalSent += int64(len(payload))
+	state.totalChunks++
+	laneDone := state.totalChunks == state.chunkCount
+	if state.totalChunks > state.chunkCount {
+		state.mu.Unlock()
+		return false, fmt.Errorf("too many chunks for hybrid file %d lane %d", state.fileIndex, state.dataConnectionIndex)
+	}
+	if laneDone {
+		state.closed = true
+	}
+	state.mu.Unlock()
+
+	fileState := state.receiveFile
+	fileState.mu.Lock()
+	if fileState.verifier != nil {
+		if position != fileState.verifyPosition {
+			fileState.verifier = nil
+		} else {
+			_, _ = fileState.verifier.Write(payload)
+			fileState.verifyPosition += int64(len(payload))
+		}
+	}
+	fileState.chunksRemaining--
+	if fileState.chunksRemaining < 0 {
+		fileState.mu.Unlock()
+		return false, fmt.Errorf("too many chunks received for hybrid file %d", state.fileIndex)
+	}
+	verifyFile := fileState.chunksRemaining == 0
+	fileState.mu.Unlock()
+
+	c.mutex.Lock()
+	c.TotalSent += int64(len(payload))
+	c.TotalChunksTransferred++
+	c.mutex.Unlock()
+	c.addFileProgress(state.bar, int64(len(payload)))
+
+	if verifyFile {
+		if err := c.verifyHybridReceiverFile(fileState); err != nil {
+			return false, err
+		}
+	}
+	if !laneDone {
+		return false, nil
+	}
+	fileState.mu.Lock()
+	fileComplete := fileState.verified
+	fileState.mu.Unlock()
+	ack, err := encodeParallelLaneAck(state.fileIndex, state.dataConnectionIndex, fileComplete)
+	if err != nil {
+		return false, err
+	}
+	if err := c.sendControl(message.Message{Type: message.TypeCloseSender, Num: state.fileIndex, Bytes: ack}); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func (c *Client) verifyHybridReceiverFile(state *parallelReceiveFileState) error {
+	state.mu.Lock()
+	if state.verifyDone {
+		state.mu.Unlock()
+		return nil
+	}
+	fileSize := c.FilesToTransfer[state.fileIndex].Size
+	var actualHash []byte
+	var err error
+	if state.verifier != nil && state.verifyPosition == fileSize {
+		actualHash = state.verifier.Sum(nil)
+	} else {
+		actualHash, err = hashOpenFile(state.file, fileSize, c.Options.HashAlgorithm)
+	}
+	if err != nil {
+		state.mu.Unlock()
+		return err
+	}
+	fileInfo := c.FilesToTransfer[state.fileIndex]
+	if !bytes.Equal(actualHash, fileInfo.Hash) {
+		state.retry = true
+		state.verifyDone = true
+		state.mu.Unlock()
+		log.Warnf("hash mismatch for %s; queueing the file again", state.path)
+		return nil
+	}
+	state.verified = true
+	state.verifyDone = true
+	state.closed = true
+	closeErr := state.file.Close()
+	state.mu.Unlock()
+	if closeErr != nil {
+		return closeErr
+	}
+	if !fileInfo.ModTime.IsZero() {
+		root, rootErr := c.receiveFilesystem()
+		if rootErr != nil {
+			return rootErr
+		}
+		if err := root.Chtimes(state.path, fileInfo.ModTime, fileInfo.ModTime); err != nil {
+			log.Warnf("chtimes %v: %v", fileInfo.ModTime, err)
+		}
+	}
+	c.rememberVerifiedReceiverFile(state.path, c.Options.HashAlgorithm, fileInfo.Hash)
+	c.markFileFinished(state.fileIndex)
+	return nil
+}
+
+func (c *Client) finishParallelReceiverFile(m message.Message) error {
+	ack, hasLane, err := decodeParallelLaneAck(m)
+	if err != nil {
+		return err
+	}
+	c.fileTransferMu.Lock()
+	hybrid := c.hybridFileMode
+	c.fileTransferMu.Unlock()
+	if hybrid {
+		if !hasLane {
+			return fmt.Errorf("hybrid acknowledgement for file %d has no lane identity", m.Num)
+		}
+		return c.finishHybridReceiverLane(ack)
+	}
+	fileIndex := m.Num
 	c.fileTransferMu.Lock()
 	var state *fileTransferState
 	for connectionIndex, candidate := range c.receiveTransfers {
@@ -605,6 +1042,76 @@ func (c *Client) finishParallelReceiverFile(fileIndex int) error {
 	return c.startParallelReceiverFile(state.dataConnectionIndex)
 }
 
+func (c *Client) finishHybridReceiverLane(ack parallelFileLaneAck) error {
+	c.fileTransferMu.Lock()
+	state := c.receiveTransfers[ack.DataConnectionIndex]
+	if state == nil || state.fileIndex != ack.FileIndex || state.receiveFile == nil {
+		c.fileTransferMu.Unlock()
+		return fmt.Errorf("acknowledgement for inactive hybrid file %d lane %d", ack.FileIndex, ack.DataConnectionIndex)
+	}
+	delete(c.receiveTransfers, ack.DataConnectionIndex)
+	fileState := state.receiveFile
+	c.fileTransferMu.Unlock()
+	c.clearParallelActiveFile(ack.DataConnectionIndex, ack.FileIndex)
+
+	fileState.mu.Lock()
+	fileState.jobsRemaining--
+	if fileState.jobsRemaining < 0 {
+		fileState.mu.Unlock()
+		return fmt.Errorf("too many lane acknowledgements for hybrid file %d", ack.FileIndex)
+	}
+	allAcknowledged := fileState.jobsRemaining == 0
+	verifyDone := fileState.verifyDone
+	verified := fileState.verified
+	retry := fileState.retry
+	fileState.mu.Unlock()
+
+	if allAcknowledged {
+		if !verifyDone {
+			return fmt.Errorf("hybrid file %d lanes closed before verification", ack.FileIndex)
+		}
+		if verified {
+			c.fileTransferMu.Lock()
+			delete(c.receiveFileStates, ack.FileIndex)
+			c.fileTransferMu.Unlock()
+		} else if retry {
+			if err := c.queueHybridFileRetry(fileState); err != nil {
+				return err
+			}
+		}
+	}
+	return c.scheduleHybridReceiverConnections()
+}
+
+func (c *Client) queueHybridFileRetry(state *parallelReceiveFileState) error {
+	fileSize := c.FilesToTransfer[state.fileIndex].Size
+	jobs := splitParallelFileJobs(state.fileIndex, nil, fileSize, hybridChunkJobTargetBytes)
+	if len(jobs) == 0 {
+		return fmt.Errorf("file %d produced no hybrid retry jobs", state.fileIndex)
+	}
+	verifier, err := newParallelFileVerifier(nil, fileSize, c.Options.HashAlgorithm)
+	if err != nil {
+		return err
+	}
+	if len(jobs) > 1 {
+		verifier = nil
+	}
+	state.mu.Lock()
+	state.chunkRanges = nil
+	state.bytesToTransfer = fileSize
+	state.chunksRemaining = utils.ChunkRangesCount(nil, fileSize, models.TCP_BUFFER_SIZE/2)
+	state.jobsRemaining = len(jobs)
+	state.verifyDone = false
+	state.verified = false
+	state.retry = false
+	state.closed = false
+	state.verifier = verifier
+	state.verifyPosition = 0
+	state.mu.Unlock()
+	c.hybridQueue.push(jobs...)
+	return nil
+}
+
 func (c *Client) startParallelSenderFile(request RemoteFileRequest, attempt *transferAttemptState) error {
 	index := request.FilesToTransferCurrentNum
 	connectionIndex := request.DataConnectionIndex
@@ -614,10 +1121,25 @@ func (c *Client) startParallelSenderFile(request RemoteFileRequest, attempt *tra
 	if connectionIndex < 0 || connectionIndex >= len(c.Options.RelayPorts) {
 		return fmt.Errorf("invalid data connection index %d", connectionIndex)
 	}
+	if err := validateParallelChunkRanges(request.CurrentFileChunkRanges, c.FilesToTransfer[index].Size); err != nil {
+		return fmt.Errorf("invalid ranges for requested file %d: %w", index, err)
+	}
 	pathToFile := path.Join(c.FilesToTransfer[index].FolderSource, c.FilesToTransfer[index].Name)
 	file, err := os.Open(pathToFile)
 	if err != nil {
 		return err
+	}
+	if c.peerHybridChunks {
+		c.fileTransferMu.Lock()
+		c.parallelFileMode = true
+		c.hybridFileMode = true
+		c.fileTransferMu.Unlock()
+	}
+	var bar *progressbar.ProgressBar
+	if c.peerHybridChunks {
+		bar = c.makeHybridSenderBar(index, request.FileTransferBytes, request.TransferTotalBytes)
+	} else {
+		bar = c.makeFileBar(index, request.CurrentFileChunkRanges)
 	}
 	state := &fileTransferState{
 		fileIndex:           index,
@@ -626,7 +1148,7 @@ func (c *Client) startParallelSenderFile(request RemoteFileRequest, attempt *tra
 		chunkRanges:         request.CurrentFileChunkRanges,
 		chunkCount: utils.ChunkRangesCount(request.CurrentFileChunkRanges,
 			c.FilesToTransfer[index].Size, models.TCP_BUFFER_SIZE/2),
-		bar: c.makeFileBar(index, request.CurrentFileChunkRanges),
+		bar: bar,
 	}
 	c.fileTransferMu.Lock()
 	if _, busy := c.senderTransfers[connectionIndex]; busy {
@@ -634,14 +1156,17 @@ func (c *Client) startParallelSenderFile(request RemoteFileRequest, attempt *tra
 		_ = file.Close()
 		return fmt.Errorf("data connection %d already sending a file", connectionIndex)
 	}
-	for _, active := range c.senderTransfers {
-		if active.fileIndex == index {
-			c.fileTransferMu.Unlock()
-			_ = file.Close()
-			return fmt.Errorf("file %d is already being sent", index)
+	if !c.peerHybridChunks {
+		for _, active := range c.senderTransfers {
+			if active.fileIndex == index {
+				c.fileTransferMu.Unlock()
+				_ = file.Close()
+				return fmt.Errorf("file %d is already being sent", index)
+			}
 		}
 	}
 	c.parallelFileMode = true
+	c.hybridFileMode = c.peerHybridChunks
 	c.senderTransfers[connectionIndex] = state
 	c.fileTransferMu.Unlock()
 	c.setParallelActiveFile(connectionIndex, index)
@@ -650,23 +1175,39 @@ func (c *Client) startParallelSenderFile(request RemoteFileRequest, attempt *tra
 	return nil
 }
 
-func (c *Client) finishParallelSenderFile(fileIndex int) error {
+func (c *Client) finishParallelSenderFile(m message.Message) error {
+	ack, hasLane, err := decodeParallelLaneAck(m)
+	if err != nil {
+		return err
+	}
+	fileIndex := m.Num
 	c.fileTransferMu.Lock()
 	var state *fileTransferState
-	for connectionIndex, candidate := range c.senderTransfers {
-		if candidate.fileIndex == fileIndex {
-			state = candidate
-			delete(c.senderTransfers, connectionIndex)
-			break
+	if hasLane {
+		state = c.senderTransfers[ack.DataConnectionIndex]
+		if state != nil && state.fileIndex == fileIndex {
+			delete(c.senderTransfers, ack.DataConnectionIndex)
+		} else {
+			state = nil
+		}
+	} else {
+		for connectionIndex, candidate := range c.senderTransfers {
+			if candidate.fileIndex == fileIndex {
+				state = candidate
+				delete(c.senderTransfers, connectionIndex)
+				break
+			}
 		}
 	}
 	c.fileTransferMu.Unlock()
 	if state == nil {
 		return fmt.Errorf("completion for inactive file %d", fileIndex)
 	}
-	c.markFileFinished(fileIndex)
+	if !hasLane || ack.FileComplete {
+		c.markFileFinished(fileIndex)
+	}
 	c.clearParallelActiveFile(state.dataConnectionIndex, fileIndex)
-	return c.sendControl(message.Message{Type: message.TypeCloseRecipient, Num: fileIndex})
+	return c.sendControl(message.Message{Type: message.TypeCloseRecipient, Num: fileIndex, Bytes: m.Bytes})
 }
 
 func (c *Client) sendParallelFileData(state *fileTransferState, dataConn *comm.Comm, attempt *transferAttemptState) {
@@ -683,12 +1224,9 @@ func (c *Client) sendParallelFileData(state *fileTransferState, dataConn *comm.C
 	payload := make([]byte, 8+chunkSize)
 	var encryptedBuffer []byte
 	var compressedBuffer []byte
-	for position := int64(0); position < fileSize; position += chunkSize {
+	sendChunk := func(position int64) bool {
 		if err := c.ctxErr(); err != nil {
-			return
-		}
-		if !utils.ChunkRangesContain(state.chunkRanges, position) {
-			continue
+			return false
 		}
 		n, readErr := state.file.ReadAt(payload[8:], position)
 		if c.limiter != nil && n > 0 {
@@ -708,14 +1246,14 @@ func (c *Client) sendParallelFileData(state *fileTransferState, dataConn *comm.C
 			}
 			if err != nil {
 				attempt.report(err)
-				return
+				return false
 			}
 			encryptedBuffer = dataToSend
 			if err := dataConn.Send(dataToSend); err != nil {
 				if c.ctxErr() == nil {
 					attempt.report(transferDisconnectError{err: err})
 				}
-				return
+				return false
 			}
 			c.addFileProgress(state.bar, int64(n))
 			c.mutex.Lock()
@@ -725,7 +1263,33 @@ func (c *Client) sendParallelFileData(state *fileTransferState, dataConn *comm.C
 		}
 		if readErr != nil && readErr != io.EOF {
 			attempt.report(readErr)
-			return
+			return false
+		}
+		return true
+	}
+	if len(state.chunkRanges) == 0 {
+		for position := int64(0); position < fileSize; position += chunkSize {
+			if !sendChunk(position) {
+				return
+			}
+		}
+		return
+	}
+	rangeChunkSize := state.chunkRanges[0]
+	if rangeChunkSize <= 0 {
+		attempt.report(fmt.Errorf("invalid chunk size %d for file %d", rangeChunkSize, state.fileIndex))
+		return
+	}
+	for index := 1; index+1 < len(state.chunkRanges); index += 2 {
+		start, count := state.chunkRanges[index], state.chunkRanges[index+1]
+		for chunk := int64(0); chunk < count; chunk++ {
+			position := start + chunk*rangeChunkSize
+			if position >= fileSize {
+				break
+			}
+			if !sendChunk(position) {
+				return
+			}
 		}
 	}
 }

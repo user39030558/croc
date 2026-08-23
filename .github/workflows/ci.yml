@@ -58,6 +58,9 @@ jobs:
       - name: Race-test relay admission
         run: go test -race ./src/tcp -run 'Test(AdmissionLimiter|RoomDenials|RelayAdmissionLimits|CanonicalSource|WithAdmissionLimits)'
 
+      - name: Race-test parallel file and hybrid chunk scheduling
+        run: go test -race ./src/croc -run 'Test(FileIndexQueueConcurrentPop|CrocParallelSmallFiles|CrocHybridChunksUseMultipleLanesPerFile|SendCollectFilesHashesConcurrently)'
+
   security-fuzz-smoke:
     name: Security fuzz smoke tests
     runs-on: ubuntu-24.04

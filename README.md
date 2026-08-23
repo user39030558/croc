@@ -386,6 +386,17 @@ hash verification still protect resumed transfers. Set `CROC_HASH_CACHE_DIR`
 to place the cache in a custom directory; otherwise croc uses the operating
 system's user cache directory.
 
+Initial hashing uses a bounded worker pool: up to eight workers for collections
+of smaller files and two workers when the average file is at least 64 MB. Set
+`CROC_HASH_WORKERS` to a value from 1 through 32 to override that choice; lower
+values are often better for spinning disks.
+
+When both peers support hybrid chunk scheduling, open data connections transfer
+different files concurrently and automatically share the remaining large files
+in 64 MB jobs. This keeps the connections busy near the end of a mixed transfer.
+The feature is negotiated between peers and does not require relay changes;
+older peers transparently use the previous sequential or parallel-file modes.
+
 #### Clipboard Options
 
 By default, the code phrase is copied to your clipboard. To disable this:
