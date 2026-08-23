@@ -378,6 +378,14 @@ For faster hashing, use the `imohash` algorithm:
 croc send --hash imohash SOMEFILE
 ```
 
+Successful source hashes and receiver-verified file hashes are cached between
+runs. Cache entries are reused only while the file path, size, modification
+time, mode, and hash algorithm still match. An interrupted or mismatched
+receiver file is never recorded as verified, so normal chunk scanning and final
+hash verification still protect resumed transfers. Set `CROC_HASH_CACHE_DIR`
+to place the cache in a custom directory; otherwise croc uses the operating
+system's user cache directory.
+
 #### Clipboard Options
 
 By default, the code phrase is copied to your clipboard. To disable this:

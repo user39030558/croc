@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash"
 	"io"
 	"net"
 	"net/url"
@@ -188,6 +189,7 @@ type Client struct {
 	reconnectVersion        int
 	peerReconnectVersion    int
 	peerPerFileCompression  bool
+	peerParallelFiles       bool
 	senderRouteReady        chan struct{}
 	filesReady              chan struct{}
 	filesReadyErr           error
@@ -201,12 +203,27 @@ type Client struct {
 	localRelayPort string
 
 	bar                *progressbar.ProgressBar
+	parallelBar        *progressbar.ProgressBar
+	parallelActive     map[int]parallelProgressFile
+	parallelProgressN  int
+	parallelDirty      bool
+	hashCache          *fileHashCache
 	longestFilename    int
 	firstSend          bool
 	receiveStatusWidth int
 
 	mutex                    *sync.Mutex
 	receiveMutex             *sync.Mutex
+	controlSendMu            sync.Mutex
+	progressMu               sync.Mutex
+	finishedMu               sync.Mutex
+	fileTransferMu           sync.Mutex
+	fileQueue                fileIndexQueue
+	parallelFileMode         bool
+	parallelFilesInitialized bool
+	receiveTransfers         map[int]*fileTransferState
+	senderTransfers          map[int]*fileTransferState
+	senderAskDone            bool
 	receiveRootMu            sync.Mutex
 	receiveRoot              *receivefs.Root
 	fread                    *os.File
@@ -247,6 +264,7 @@ type FileInfo struct {
 type RemoteFileRequest struct {
 	CurrentFileChunkRanges    []int64
 	FilesToTransferCurrentNum int
+	DataConnectionIndex       int `json:",omitempty"`
 	MachineID                 string
 	ReconnectVersion          int
 	Features                  []string `json:",omitempty"`
@@ -267,7 +285,61 @@ type SenderInfo struct {
 	Features               []string `json:",omitempty"`
 }
 
-const perFileCompressionFeature = "per-file-compression-v1"
+const (
+	perFileCompressionFeature = "per-file-compression-v1"
+	parallelFilesFeature      = "parallel-files-v1"
+)
+
+// fileTransferState contains all mutable state for one file. In parallel-file
+// mode a state is owned by exactly one data connection at a time.
+type fileTransferState struct {
+	mu                  sync.Mutex
+	fileIndex           int
+	dataConnectionIndex int
+	path                string
+	file                *os.File
+	chunkRanges         []int64
+	chunkCount          int
+	totalSent           int64
+	totalChunks         int
+	closed              bool
+	retry               bool
+	bar                 *progressbar.ProgressBar
+	verifier            hash.Hash
+	verifyPosition      int64
+}
+
+// fileIndexQueue is a small concurrent-safe work queue. Reconnects rebuild it
+// from FilesHasFinished, so only the cursor and pending indices live here.
+type fileIndexQueue struct {
+	mu      sync.Mutex
+	indices []int
+	next    int
+}
+
+func (q *fileIndexQueue) reset(indices []int) {
+	q.mu.Lock()
+	q.indices = append(q.indices[:0], indices...)
+	q.next = 0
+	q.mu.Unlock()
+}
+
+func (q *fileIndexQueue) pop() (int, bool) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if q.next >= len(q.indices) {
+		return 0, false
+	}
+	index := q.indices[q.next]
+	q.next++
+	return index, true
+}
+
+func (q *fileIndexQueue) push(index int) {
+	q.mu.Lock()
+	q.indices = append(q.indices, index)
+	q.mu.Unlock()
+}
 
 // ErrRelayConnection marks a failure to establish a relay control or data
 // connection. Callers may use it to invalidate cached relay selections without
@@ -288,6 +360,8 @@ func New(ops Options) (c *Client, err error) {
 	defer func() { err = redact.Error(err, ops.SharedSecret) }()
 	c = new(Client)
 	c.FilesHasFinished = make(map[int]struct{})
+	c.receiveTransfers = make(map[int]*fileTransferState)
+	c.senderTransfers = make(map[int]*fileTransferState)
 
 	// setup basic info
 	c.Options = ops
@@ -363,6 +437,7 @@ func New(ops Options) (c *Client, err error) {
 	c.senderRouteReady = make(chan struct{})
 	c.externalIPReady = make(chan struct{})
 	c.stop = newStop(context.Background())
+	c.hashCache = defaultFileHashCache()
 	return
 }
 
@@ -375,6 +450,12 @@ func (c *Client) redactError(err error) error {
 		c.Options.RoomName,
 		c.nextReconnectRoom,
 	)
+}
+
+func (c *Client) sendControl(m message.Message) error {
+	c.controlSendMu.Lock()
+	defer c.controlSendMu.Unlock()
+	return message.Send(c.conn[0], c.Key, m)
 }
 
 type transferDisconnectError struct {
@@ -611,6 +692,7 @@ func (c *Client) closeAttempt() {
 			conn.Close()
 		}
 	}
+	c.closeParallelFileStates()
 	c.receiveMutex.Lock()
 	if c.CurrentFile != nil && !c.CurrentFileIsClosed {
 		if err := c.CurrentFile.Close(); err != nil {
@@ -646,11 +728,28 @@ func (c *Client) resetForReconnectAttempt(attempt int) error {
 	c.pakeKeys = pakekey.Keys{}
 	c.pakeConfirmationPending = false
 	c.peerPerFileCompression = false
+	c.peerParallelFiles = false
 	c.CurrentFileChunkRanges = nil
 	c.CurrentFileChunkCount = 0
-	c.TotalSent = 0
-	c.TotalChunksTransferred = 0
+	if c.Options.IsSender || c.parallelFileMode {
+		c.mutex.Lock()
+		c.TotalSent = 0
+		c.TotalChunksTransferred = 0
+		c.mutex.Unlock()
+	} else {
+		c.receiveMutex.Lock()
+		c.TotalSent = 0
+		c.TotalChunksTransferred = 0
+		c.receiveMutex.Unlock()
+	}
 	c.numfinished = 0
+	c.fileTransferMu.Lock()
+	c.parallelFileMode = false
+	c.parallelFilesInitialized = false
+	c.receiveTransfers = make(map[int]*fileTransferState)
+	c.senderTransfers = make(map[int]*fileTransferState)
+	c.fileTransferMu.Unlock()
+	c.fileQueue.reset(nil)
 	if !c.Options.IsSender {
 		pakeInstance, err := pakekey.Init(
 			[]byte(c.pakePassphrase),
@@ -1089,6 +1188,7 @@ func exactPathExcluded(exclusions []string, candidate string) bool {
 func (c *Client) sendCollectFiles(filesInfo []FileInfo) (err error) {
 	c.FilesToTransfer = filesInfo
 	totalFilesSize := int64(0)
+	cachedHashes := 0
 	compressionSample := make([]byte, compressionSampleSize)
 	var compressionOutput []byte
 
@@ -1121,7 +1221,11 @@ func (c *Client) sendCollectFiles(filesInfo []FileInfo) (err error) {
 			)
 		}
 
-		c.FilesToTransfer[i].Hash, err = c.stop.hash(fullPath, c.Options.HashAlgorithm, fileInfo.Size > 1e7)
+		var cacheHit bool
+		c.FilesToTransfer[i].Hash, cacheHit, err = c.hashSourceFile(fullPath, c.Options.HashAlgorithm, fileInfo.Size > 1e7)
+		if cacheHit {
+			cachedHashes++
+		}
 		log.Debugf("hashed %s to %x using %s", fullPath, c.FilesToTransfer[i].Hash, c.Options.HashAlgorithm)
 		totalFilesSize += fileInfo.Size
 		if err != nil {
@@ -1131,6 +1235,10 @@ func (c *Client) sendCollectFiles(filesInfo []FileInfo) (err error) {
 		fmt.Fprintf(os.Stderr, "\r                                 ")
 		output, _ := termui.Output(os.Stderr)
 		fmt.Fprintf(output, "\rSending %d files (%s)", i, utils.ByteCountDecimal(totalFilesSize))
+	}
+	if cachedHashes > 0 {
+		output, colorEnabled := termui.Output(os.Stderr)
+		fmt.Fprintf(output, "\n%s\n", termui.Success(fmt.Sprintf("Reused %d cached file hashes", cachedHashes), colorEnabled))
 	}
 	log.Debugf("longestFilename: %+v", c.longestFilename)
 	fname := fmt.Sprintf("%d files", len(c.FilesToTransfer))
@@ -1185,6 +1293,10 @@ func shouldCompressFile(path string, sample, compressedOutput []byte) (bool, []b
 }
 
 func (c *Client) currentFileUsesCompression() bool {
+	return c.fileUsesCompression(c.FilesToTransferCurrentNum)
+}
+
+func (c *Client) fileUsesCompression(fileIndex int) bool {
 	if c.Options.NoCompress {
 		return false
 	}
@@ -1193,9 +1305,9 @@ func (c *Client) currentFileUsesCompression() bool {
 	if !c.peerPerFileCompression {
 		return true
 	}
-	return c.FilesToTransferCurrentNum >= 0 &&
-		c.FilesToTransferCurrentNum < len(c.FilesToTransfer) &&
-		c.FilesToTransfer[c.FilesToTransferCurrentNum].IsCompressed
+	return fileIndex >= 0 &&
+		fileIndex < len(c.FilesToTransfer) &&
+		c.FilesToTransfer[fileIndex].IsCompressed
 }
 
 func (c *Client) setupLocalRelay() {
@@ -2243,6 +2355,7 @@ func (c *Client) processMessageFileInfo(m message.Message) (done bool, err error
 	c.Options.SendingText = senderInfo.SendingText
 	c.Options.NoCompress = senderInfo.NoCompress
 	c.peerPerFileCompression = supportsFeature(senderInfo.Features, perFileCompressionFeature)
+	c.peerParallelFiles = supportsFeature(senderInfo.Features, parallelFilesFeature)
 	c.Options.HashAlgorithm = senderInfo.HashAlgorithm
 	c.peerReconnectVersion = senderInfo.ReconnectVersion
 	c.nextReconnectRoom = senderInfo.NextReconnectRoom
@@ -2650,6 +2763,9 @@ func (c *Client) processMessage(payload []byte, attempt *transferAttemptState) (
 
 	switch m.Type {
 	case message.TypeFinished:
+		if c.parallelFileMode {
+			c.finishParallelProgress()
+		}
 		err = message.Send(c.conn[0], c.Key, message.Message{
 			Type: message.TypeFinished,
 		})
@@ -2685,18 +2801,9 @@ func (c *Client) processMessage(payload []byte, attempt *transferAttemptState) (
 		}
 		c.peerReconnectVersion = remoteFile.ReconnectVersion
 		c.peerPerFileCompression = supportsFeature(remoteFile.Features, perFileCompressionFeature)
-		c.FilesToTransferCurrentNum = remoteFile.FilesToTransferCurrentNum
-		c.CurrentFileChunkRanges = remoteFile.CurrentFileChunkRanges
-		c.CurrentFileChunkCount = utils.ChunkRangesCount(
-			c.CurrentFileChunkRanges,
-			c.FilesToTransfer[c.FilesToTransferCurrentNum].Size,
-			models.TCP_BUFFER_SIZE/2,
-		)
-		log.Debugf("current file has %d requested chunks", c.CurrentFileChunkCount)
-		c.Step3RecipientRequestFile = true
-		c.markTransferStarted()
+		c.peerParallelFiles = supportsFeature(remoteFile.Features, parallelFilesFeature)
 
-		if c.Options.Ask {
+		if c.Options.Ask && !c.senderAskDone {
 			output, colorEnabled := termui.Output(os.Stderr)
 			fmt.Fprintf(output, "Send to machine '%s'? %s ",
 				remoteFile.MachineID,
@@ -2712,8 +2819,36 @@ func (c *Client) processMessage(payload []byte, attempt *transferAttemptState) (
 				done = true
 				return
 			}
+			c.senderAskDone = true
 		}
+		if c.peerParallelFiles && len(c.FilesToTransfer) > 1 &&
+			len(c.Options.RelayPorts) > 1 && !c.Options.SendingText {
+			if !c.firstSend {
+				output, _ := termui.Output(os.Stderr)
+				fmt.Fprintf(output, "\nSending (->%s)\n", peerIP(c.ExternalIPConnected))
+				c.firstSend = true
+			}
+			err = c.startParallelSenderFile(remoteFile, attempt)
+			if err != nil {
+				return false, err
+			}
+			break
+		}
+		c.FilesToTransferCurrentNum = remoteFile.FilesToTransferCurrentNum
+		c.CurrentFileChunkRanges = remoteFile.CurrentFileChunkRanges
+		c.CurrentFileChunkCount = utils.ChunkRangesCount(
+			c.CurrentFileChunkRanges,
+			c.FilesToTransfer[c.FilesToTransferCurrentNum].Size,
+			models.TCP_BUFFER_SIZE/2,
+		)
+		log.Debugf("current file has %d requested chunks", c.CurrentFileChunkCount)
+		c.Step3RecipientRequestFile = true
+		c.markTransferStarted()
 	case message.TypeCloseSender:
+		if c.parallelFileMode {
+			err = c.finishParallelSenderFile(m.Num)
+			break
+		}
 		c.bar.Finish()
 		log.Debug("close-sender received...")
 		c.Step4FileTransferred = false
@@ -2723,6 +2858,10 @@ func (c *Client) processMessage(payload []byte, attempt *transferAttemptState) (
 			Type: message.TypeCloseRecipient,
 		})
 	case message.TypeCloseRecipient:
+		if c.parallelFileMode {
+			err = c.finishParallelReceiverFile(m.Num)
+			break
+		}
 		c.Step4FileTransferred = false
 		c.Step3RecipientRequestFile = false
 	}
@@ -2771,7 +2910,7 @@ func (c *Client) updateIfSenderChannelSecured() (err error) {
 			HashAlgorithm:          c.Options.HashAlgorithm,
 			ReconnectVersion:       c.reconnectVersion,
 			NextReconnectRoom:      nextReconnectRoom,
-			Features:               []string{perFileCompressionFeature},
+			Features:               []string{perFileCompressionFeature, parallelFilesFeature},
 		})
 		if err != nil {
 			log.Error(err)
@@ -2790,72 +2929,109 @@ func (c *Client) updateIfSenderChannelSecured() (err error) {
 	return
 }
 
-func (c *Client) recipientInitializeFile() (err error) {
+func (c *Client) recipientInitializeFileState(fileIndex int) (state *fileTransferState, err error) {
 	// start initiating the process to receive a new file
-	log.Debugf("working on file %d", c.FilesToTransferCurrentNum)
+	log.Debugf("working on file %d", fileIndex)
+	if fileIndex < 0 || fileIndex >= len(c.FilesToTransfer) {
+		return nil, fmt.Errorf("invalid file index %d", fileIndex)
+	}
 
 	// recipient sets the file
 	folderRemote, pathToFile, err := normalizeReceiveFilePath(
-		c.FilesToTransfer[c.FilesToTransferCurrentNum].FolderRemote,
-		c.FilesToTransfer[c.FilesToTransferCurrentNum].Name,
+		c.FilesToTransfer[fileIndex].FolderRemote,
+		c.FilesToTransfer[fileIndex].Name,
 	)
 	if err != nil {
-		return
+		return nil, err
 	}
-	c.FilesToTransfer[c.FilesToTransferCurrentNum].FolderRemote = folderRemote
-	c.FilesToTransfer[c.FilesToTransferCurrentNum].Name = path.Base(pathToFile)
+	c.FilesToTransfer[fileIndex].FolderRemote = folderRemote
+	c.FilesToTransfer[fileIndex].Name = path.Base(pathToFile)
 	folderForFile, _ := filepath.Split(pathToFile)
 	folderForFileBase := filepath.Base(folderForFile)
 	root, err := c.receiveFilesystem()
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if folderForFileBase != "." && folderForFileBase != "" {
 		if err := root.MkdirAll(folderForFile, os.ModePerm); err != nil {
 			log.Errorf("can't create %s: %v", folderForFile, err)
-			return err
+			return nil, err
 		}
 	}
+	state = &fileTransferState{
+		fileIndex: fileIndex,
+		path:      pathToFile,
+	}
 	var errOpen error
-	c.CurrentFile, errOpen = root.OpenFile(
+	state.file, errOpen = root.OpenFile(
 		pathToFile,
 		os.O_RDWR, 0o666)
 	var truncate bool // default false
-	c.CurrentFileChunkRanges = []int64{}
+	state.chunkRanges = []int64{}
 	if errOpen == nil {
-		stat, _ := c.CurrentFile.Stat()
-		truncate = stat.Size() != c.FilesToTransfer[c.FilesToTransferCurrentNum].Size
+		stat, statErr := state.file.Stat()
+		if statErr != nil {
+			_ = state.file.Close()
+			return nil, statErr
+		}
+		truncate = stat.Size() != c.FilesToTransfer[fileIndex].Size
 		if !truncate {
 			// recipient requests the file and chunks (if empty, then should receive all chunks)
 			// TODO: determine the missing chunks
-			c.CurrentFileChunkRanges = utils.MissingChunks(
+			state.chunkRanges = utils.MissingChunks(
 				pathToFile,
-				c.FilesToTransfer[c.FilesToTransferCurrentNum].Size,
+				c.FilesToTransfer[fileIndex].Size,
 				models.TCP_BUFFER_SIZE/2,
 			)
 		}
 	} else {
-		c.CurrentFile, errOpen = root.OpenFile(pathToFile, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o666)
+		state.file, errOpen = root.OpenFile(pathToFile, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o666)
 		if errOpen != nil {
 			errOpen = fmt.Errorf("could not create %s: %w", pathToFile, errOpen)
 			log.Error(errOpen)
-			return errOpen
+			return nil, errOpen
 		}
-		errChmod := c.CurrentFile.Chmod(c.FilesToTransfer[c.FilesToTransferCurrentNum].Mode.Perm())
+		errChmod := state.file.Chmod(c.FilesToTransfer[fileIndex].Mode.Perm())
 		if errChmod != nil {
 			log.Error(errChmod)
 		}
 		truncate = true
 	}
 	if truncate {
-		err := c.CurrentFile.Truncate(c.FilesToTransfer[c.FilesToTransferCurrentNum].Size)
+		err := state.file.Truncate(c.FilesToTransfer[fileIndex].Size)
 		if err != nil {
+			_ = state.file.Close()
 			err = fmt.Errorf("could not truncate %s: %w", pathToFile, err)
 			log.Error(err)
-			return err
+			return nil, err
 		}
 	}
-	return
+	state.chunkCount = utils.ChunkRangesCount(
+		state.chunkRanges,
+		c.FilesToTransfer[fileIndex].Size,
+		models.TCP_BUFFER_SIZE/2,
+	)
+	state.verifier, err = newParallelFileVerifier(
+		state.chunkRanges,
+		c.FilesToTransfer[fileIndex].Size,
+		c.Options.HashAlgorithm,
+	)
+	if err != nil {
+		_ = state.file.Close()
+		return nil, err
+	}
+	return state, nil
+}
+
+func (c *Client) recipientInitializeFile() (err error) {
+	state, err := c.recipientInitializeFileState(c.FilesToTransferCurrentNum)
+	if err != nil {
+		return err
+	}
+	c.CurrentFile = state.file
+	c.CurrentFileChunkRanges = state.chunkRanges
+	c.CurrentFileChunkCount = state.chunkCount
+	return nil
 }
 
 func (c *Client) recipientGetFileReady(finished bool) (err error) {
@@ -2889,7 +3065,7 @@ func (c *Client) recipientGetFileReady(finished bool) (err error) {
 		FilesToTransferCurrentNum: c.FilesToTransferCurrentNum,
 		MachineID:                 machID,
 		ReconnectVersion:          c.reconnectVersion,
-		Features:                  []string{perFileCompressionFeature},
+		Features:                  []string{perFileCompressionFeature, parallelFilesFeature},
 	})
 	c.CurrentFileChunkCount = utils.ChunkRangesCount(
 		c.CurrentFileChunkRanges,
@@ -3007,6 +3183,9 @@ func (c *Client) updateIfRecipientHasFileInfo() (err error) {
 	if c.Options.IsSender || !c.Step2FileInfoTransferred || c.Step3RecipientRequestFile {
 		return
 	}
+	if c.parallelFilesEnabled() {
+		return c.initializeParallelFileTransfers()
+	}
 	// find the next file to transfer and send that number
 	// if the files are the same size, then look for missing chunks
 	finished := true
@@ -3027,7 +3206,12 @@ func (c *Client) updateIfRecipientHasFileInfo() (err error) {
 		var fileHash []byte
 		if errRecipientFile == nil && recipientFileInfo.Size() == fileInfo.Size {
 			// the file exists, but is same size, so hash it
-			fileHash, errHash = utils.HashFile(path.Join(fileInfo.FolderRemote, fileInfo.Name), c.Options.HashAlgorithm, !c.Options.SendingText)
+			fileHash, _, errHash = c.hashReceiverFile(
+				path.Join(fileInfo.FolderRemote, fileInfo.Name),
+				c.Options.HashAlgorithm,
+				fileInfo.Hash,
+				!c.Options.SendingText,
+			)
 		}
 		if fileInfo.Size == 0 || fileInfo.Symlink != "" {
 			err = c.createEmptyFileAndFinish(fileInfo, i)
@@ -3103,6 +3287,11 @@ func (c *Client) updateIfRecipientHasFileInfo() (err error) {
 					log.Debugf("chtimes %v", fileInfo.ModTime)
 				}
 			}
+			c.rememberVerifiedReceiverFile(
+				path.Join(fileInfo.FolderRemote, fileInfo.Name),
+				c.Options.HashAlgorithm,
+				fileInfo.Hash,
+			)
 		}
 		if errHash != nil {
 			// probably can't find, its okay
@@ -3126,6 +3315,8 @@ func (c *Client) updateIfRecipientHasFileInfo() (err error) {
 }
 
 func (c *Client) fmtPrintUpdate() {
+	c.finishedMu.Lock()
+	defer c.finishedMu.Unlock()
 	c.finishedNum++
 	if c.TotalNumberOfContents > 1 {
 		output, colorEnabled := termui.Output(os.Stderr)
@@ -3146,7 +3337,7 @@ func (c *Client) updateState(attempt *transferAttemptState) (err error) {
 		return
 	}
 
-	if c.Options.IsSender && c.Step3RecipientRequestFile && !c.Step4FileTransferred {
+	if c.Options.IsSender && !c.parallelFileMode && c.Step3RecipientRequestFile && !c.Step4FileTransferred {
 		log.Debug("start sending data!")
 
 		if !c.firstSend {
@@ -3253,7 +3444,16 @@ func (c *Client) receiveData(i int, dataConn *comm.Comm, attempt *transferAttemp
 			attempt.report(err)
 			return
 		}
-		if c.currentFileUsesCompression() {
+		parallelState, parallelMode := c.parallelReceiveState(i)
+		usesCompression := c.currentFileUsesCompression()
+		if parallelMode {
+			if parallelState == nil {
+				attempt.report(fmt.Errorf("received data on idle connection %d", i))
+				return
+			}
+			usesCompression = c.fileUsesCompression(parallelState.fileIndex)
+		}
+		if usesCompression {
 			data, err = compress.DecompressTo(decompressedBuffer, data, maxDecompressedChunkSize)
 			if err != nil {
 				attempt.report(fmt.Errorf("decompress data chunk: %w", err))
@@ -3264,6 +3464,13 @@ func (c *Client) receiveData(i int, dataConn *comm.Comm, attempt *transferAttemp
 		if len(data) < 9 || len(data) > maxDecompressedChunkSize {
 			attempt.report(fmt.Errorf("invalid data chunk size: %d", len(data)))
 			return
+		}
+		if parallelMode {
+			if _, err := c.receiveParallelData(parallelState, data); err != nil {
+				attempt.report(err)
+				return
+			}
+			continue
 		}
 
 		// get position

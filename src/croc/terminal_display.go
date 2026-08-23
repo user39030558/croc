@@ -78,6 +78,26 @@ func (c *Client) newProgressBar(max int64, description string, throttle time.Dur
 	return progressbar.NewOptions64(max, options...)
 }
 
+func (c *Client) newAggregateProgressBar(max int64, description string) *progressbar.ProgressBar {
+	output, colorEnabled := termui.Output(os.Stderr)
+	options := []progressbar.Option{
+		progressbar.OptionOnCompletion(func() {
+			_, _ = fmt.Fprintln(output)
+		}),
+		progressbar.OptionSetWidth(20),
+		progressbar.OptionSetDescription(description),
+		progressbar.OptionSetRenderBlankState(true),
+		progressbar.OptionShowBytes(true),
+		progressbar.OptionShowCount(),
+		progressbar.OptionSetWriter(progressBarWriter(output, colorEnabled)),
+		progressbar.OptionSetVisibility(!c.Options.SendingText),
+		progressbar.OptionEnableColorCodes(colorEnabled),
+		progressbar.OptionSetTheme(progressBarTheme(colorEnabled)),
+		progressbar.OptionThrottle(150 * time.Millisecond),
+	}
+	return progressbar.NewOptions64(max, options...)
+}
+
 func styleProgressFilename(description string, colorEnabled bool) string {
 	if !colorEnabled {
 		return description

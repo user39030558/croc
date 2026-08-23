@@ -6,6 +6,7 @@ import (
 	"crypto/md5"
 	"encoding/hex"
 	"fmt"
+	"hash"
 	"io"
 	"os"
 	"time"
@@ -14,6 +15,34 @@ import (
 	"github.com/minio/highwayhash"
 	"github.com/schollz/progressbar/v3"
 )
+
+const highwayHashKey = "1553c5383fb0b86578c3310da665b4f6e0521acf22eb58a99532ffed02a6b115"
+
+// NewStreamingHash returns a streaming implementation compatible with
+// HashFileCtx. Imohash samples a SectionReader and therefore deliberately
+// falls back to file-based verification.
+func NewStreamingHash(algorithm string) (hasher hash.Hash, supported bool, err error) {
+	switch algorithm {
+	case "imohash":
+		return nil, false, nil
+	case "md5":
+		return md5.New(), true, nil
+	case "xxhash":
+		return xxhash.New(), true, nil
+	case "highway":
+		key, decodeErr := hex.DecodeString(highwayHashKey)
+		if decodeErr != nil {
+			return nil, false, decodeErr
+		}
+		hasher, newErr := highwayhash.New(key)
+		if newErr != nil {
+			return nil, false, fmt.Errorf("could not create highwayhash: %w", newErr)
+		}
+		return hasher, true, nil
+	default:
+		return nil, false, fmt.Errorf("unsupported algorithm: %s", algorithm)
+	}
+}
 
 // ctxFile wraps os.File with context cancellation support.
 type ctxFile struct {
@@ -249,7 +278,7 @@ func HighwayHashReader(sr *io.SectionReader, bar *progressbar.ProgressBar) ([]by
 		return nil, err
 	}
 
-	key, err := hex.DecodeString("1553c5383fb0b86578c3310da665b4f6e0521acf22eb58a99532ffed02a6b115")
+	key, err := hex.DecodeString(highwayHashKey)
 	if err != nil {
 		return nil, err
 	}

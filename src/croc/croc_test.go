@@ -42,6 +42,207 @@ func init() {
 
 var benchmarkChunkOffsetSum int64
 
+func TestFileIndexQueueConcurrentPop(t *testing.T) {
+	const fileCount = 1000
+	indices := make([]int, fileCount)
+	for index := range indices {
+		indices[index] = index
+	}
+	var queue fileIndexQueue
+	queue.reset(indices)
+	results := make(chan int, fileCount)
+	var workers sync.WaitGroup
+	for range 8 {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			for {
+				index, ok := queue.pop()
+				if !ok {
+					return
+				}
+				results <- index
+			}
+		}()
+	}
+	workers.Wait()
+	close(results)
+	seen := make(map[int]struct{}, fileCount)
+	for index := range results {
+		if _, duplicate := seen[index]; duplicate {
+			t.Fatalf("file index %d was claimed more than once", index)
+		}
+		seen[index] = struct{}{}
+	}
+	if len(seen) != fileCount {
+		t.Fatalf("claimed %d file indices, want %d", len(seen), fileCount)
+	}
+}
+
+func TestParallelFileStreamingVerifierSelection(t *testing.T) {
+	const fileSize = int64(models.TCP_BUFFER_SIZE)
+
+	verifier, err := newParallelFileVerifier(nil, fileSize, "xxhash")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if verifier == nil {
+		t.Fatal("full-file transfer should use streaming verification")
+	}
+
+	partialRanges := []int64{models.TCP_BUFFER_SIZE / 2, 0, 1}
+	verifier, err = newParallelFileVerifier(partialRanges, fileSize, "xxhash")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if verifier != nil {
+		t.Fatal("resumed transfer should use full-file verification")
+	}
+
+	verifier, err = newParallelFileVerifier(nil, fileSize, "imohash")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if verifier != nil {
+		t.Fatal("imohash should use its SectionReader verifier")
+	}
+}
+
+func TestParallelProgressDescriptionTracksActiveFiles(t *testing.T) {
+	files := make([]FileInfo, aggregateProgressFileThreshold+1)
+	files[3].Name = "very-long-数据文件-name-that-needs-to-be-truncated.xml"
+	files[7].Name = "second.txt"
+	client := &Client{FilesToTransfer: files}
+
+	client.setParallelActiveFile(0, 3)
+	client.setParallelActiveFile(1, 7)
+	client.markParallelProgressFinished(3)
+
+	client.progressMu.Lock()
+	description := client.parallelProgressDescriptionLocked()
+	client.progressMu.Unlock()
+	assert.Contains(t, description, "Sent 1 file")
+	assert.Contains(t, description, "very-long-数据文件-name")
+	assert.Contains(t, description, "...")
+	assert.Contains(t, description, "(+1)")
+
+	client.clearParallelActiveFile(0, 3)
+	client.progressMu.Lock()
+	description = client.parallelProgressDescriptionLocked()
+	client.progressMu.Unlock()
+	assert.Contains(t, description, "Active: second.txt")
+	assert.NotContains(t, description, "(+1)")
+}
+
+func TestParallelFileRequestWireRoundTrip(t *testing.T) {
+	want := RemoteFileRequest{
+		CurrentFileChunkRanges:    []int64{1024, 0, 2},
+		FilesToTransferCurrentNum: 17,
+		DataConnectionIndex:       3,
+		ReconnectVersion:          ReconnectVersion,
+		Features:                  []string{parallelFilesFeature},
+	}
+	encoded, err := json.Marshal(want)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got RemoteFileRequest
+	if err := json.Unmarshal(encoded, &got); err != nil {
+		t.Fatal(err)
+	}
+	assert.Equal(t, want, got)
+}
+
+func TestParallelFilesRequireMultipleFilesAndConnections(t *testing.T) {
+	client := &Client{
+		peerParallelFiles: true,
+		FilesToTransfer:   []FileInfo{{Name: "one"}, {Name: "two"}},
+		Options:           Options{RelayPorts: []string{"1", "2"}},
+	}
+	assert.True(t, client.parallelFilesEnabled())
+	client.Options.RelayPorts = []string{"1"}
+	assert.False(t, client.parallelFilesEnabled())
+	client.Options.RelayPorts = []string{"1", "2"}
+	client.FilesToTransfer = client.FilesToTransfer[:1]
+	assert.False(t, client.parallelFilesEnabled())
+}
+
+func TestCrocParallelSmallFiles(t *testing.T) {
+	testDir := t.TempDir()
+	sourceDir := filepath.Join(testDir, "source")
+	receiveDir := filepath.Join(testDir, "receive")
+	if err := os.MkdirAll(sourceDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(receiveDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	paths := make([]string, aggregateProgressFileThreshold+8)
+	want := make(map[string][]byte, len(paths))
+	for index := range paths {
+		name := fmt.Sprintf("small-%02d.txt", index)
+		contents := bytes.Repeat([]byte{byte(index + 1)}, 1024+index*137)
+		paths[index] = filepath.Join(sourceDir, name)
+		want[name] = contents
+		if err := os.WriteFile(paths[index], contents, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	files, emptyFolders, folderCount, err := GetFilesInfo(paths, false, false, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	originalCwd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(receiveDir); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(originalCwd) })
+
+	secret := fmt.Sprintf("parallel-small-files-%d", time.Now().UnixNano())
+	sender, err := New(Options{
+		IsSender: true, SharedSecret: secret, RelayAddress: "127.0.0.1:8281",
+		RelayPorts: []string{"8281"}, RelayPassword: "pass123", NoPrompt: true,
+		DisableLocal: true, Curve: "siec", Overwrite: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	receiver, err := New(Options{
+		SharedSecret: secret, RelayAddress: "127.0.0.1:8281", RelayPassword: "pass123",
+		NoPrompt: true, DisableLocal: true, Curve: "siec", Overwrite: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	errors := make(chan error, 2)
+	go func() { errors <- sender.Send(files, emptyFolders, folderCount) }()
+	time.Sleep(100 * time.Millisecond)
+	go func() { errors <- receiver.Receive() }()
+	for range 2 {
+		if err := <-errors; err != nil {
+			t.Fatalf("parallel transfer failed: %v", err)
+		}
+	}
+	if !sender.parallelFileMode || !receiver.parallelFileMode {
+		t.Fatal("both peers should negotiate parallel-file mode")
+	}
+	if len(receiver.FilesHasFinished) != len(paths) {
+		t.Fatalf("receiver marked %d files finished, want %d", len(receiver.FilesHasFinished), len(paths))
+	}
+	for name, expected := range want {
+		actual, err := os.ReadFile(filepath.Join(receiveDir, name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(actual, expected) {
+			t.Fatalf("received contents differ for %s", name)
+		}
+	}
+}
+
 func BenchmarkSenderChunkScheduling(b *testing.B) {
 	const fileSize = int64(256 * 1024 * 1024)
 	const connections = int64(16)

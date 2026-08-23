@@ -32,6 +32,40 @@ func bigFile() {
 	os.WriteFile("bigfile.test", bytes.Repeat([]byte("z"), bigFileSize), 0o666)
 }
 
+func TestNewStreamingHashMatchesFileHash(t *testing.T) {
+	contents := bytes.Repeat([]byte("small-file-hash-data"), 257)
+	name := filepath.Join(t.TempDir(), "sample.txt")
+	if err := os.WriteFile(name, contents, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, algorithm := range []string{"md5", "xxhash", "highway"} {
+		t.Run(algorithm, func(t *testing.T) {
+			expected, err := HashFile(name, algorithm, false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			hasher, supported, err := NewStreamingHash(algorithm)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !supported {
+				t.Fatalf("%s should support streaming", algorithm)
+			}
+			if _, err := hasher.Write(contents); err != nil {
+				t.Fatal(err)
+			}
+			assert.Equal(t, expected, hasher.Sum(nil))
+		})
+	}
+
+	if hasher, supported, err := NewStreamingHash("imohash"); err != nil || supported || hasher != nil {
+		t.Fatalf("imohash streaming result = (%v, %v, %v), want (nil, false, nil)", hasher, supported, err)
+	}
+	if _, _, err := NewStreamingHash("unknown"); err == nil {
+		t.Fatal("unsupported hash algorithm should fail")
+	}
+}
+
 func TestShortenProgressFilename(t *testing.T) {
 	tests := []struct {
 		name  string
