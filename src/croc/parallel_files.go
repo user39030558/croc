@@ -503,7 +503,7 @@ func (c *Client) initializeParallelFileTransfers() error {
 		return c.initializeHybridFileTransfers(pending)
 	}
 	workers := min(len(c.Options.RelayPorts), len(pending))
-	for connectionIndex := 0; connectionIndex < workers; connectionIndex++ {
+	for connectionIndex := range workers {
 		if err := c.startParallelReceiverFile(connectionIndex); err != nil {
 			return err
 		}
