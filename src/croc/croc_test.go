@@ -68,9 +68,7 @@ func TestFileIndexQueueConcurrentPop(t *testing.T) {
 	results := make(chan int, fileCount)
 	var workers sync.WaitGroup
 	for range 8 {
-		workers.Add(1)
-		go func() {
-			defer workers.Done()
+		workers.Go(func() {
 			for {
 				index, ok := queue.pop()
 				if !ok {
@@ -78,7 +76,7 @@ func TestFileIndexQueueConcurrentPop(t *testing.T) {
 				}
 				results <- index
 			}
-		}()
+		})
 	}
 	workers.Wait()
 	close(results)

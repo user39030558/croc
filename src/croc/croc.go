@@ -1528,15 +1528,13 @@ func (c *Client) sendCollectFiles(filesInfo []FileInfo) (err error) {
 	results := make(chan prepareResult, len(toPrepare))
 	var workers sync.WaitGroup
 	for range workerCount {
-		workers.Add(1)
-		go func() {
-			defer workers.Done()
+		workers.Go(func() {
 			var scratch filePreparationScratch
 			for index := range jobs {
 				cacheHit, prepErr := c.prepareFile(index, c.preparedHashAlgorithm, &scratch)
 				results <- prepareResult{index: index, cacheHit: cacheHit, err: prepErr}
 			}
-		}()
+		})
 	}
 	for _, index := range toPrepare {
 		jobs <- index
@@ -1617,10 +1615,7 @@ func hashWorkerCount(files []FileInfo) int {
 		}
 		return configured
 	}
-	workers := runtime.GOMAXPROCS(0)
-	if workers > 8 {
-		workers = 8
-	}
+	workers := min(runtime.GOMAXPROCS(0), 8)
 	var totalSize int64
 	for _, fileInfo := range files {
 		totalSize += fileInfo.Size
