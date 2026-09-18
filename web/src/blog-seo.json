@@ -13,10 +13,11 @@
   },
   "index": {
     "title": "croc field notes: secure file transfer explained",
-    "description": "Notes and release updates from inside croc: live relays, PAKE encryption, browser transfers, temporary storage, and what changed in each version.",
+    "description": "Notes and release updates from inside croc: safe self-updates, terminal sharing, speed tests, live relays, PAKE encryption, browser transfers, and what changed in each version.",
     "keywords": [
       "croc blog",
       "croc release notes",
+      "shared terminal",
       "encrypted file transfer",
       "secure file sharing",
       "password-authenticated key exchange",
@@ -27,6 +28,156 @@
     "imageAlt": "An open field notebook containing simple symbols for a relay, code tiles, a key, and a file."
   },
   "posts": [
+    {
+      "slug": "croc-v11-5-release-update",
+      "title": "croc v11.5 can update itself",
+      "seoTitle": "croc v11.5: Safe Self-Updates and Clearer SSH Sessions",
+      "description": "croc v11.5 adds safe self-updates and makes shared SSH sessions clearer when they start, reconnect, or end.",
+      "kind": "update",
+      "category": "Release notes",
+      "publishedAt": "2026-09-05",
+      "modifiedAt": "2026-09-05",
+      "wordCount": 811,
+      "readingMinutes": 4,
+      "relatedSlugs": [
+        "croc-v11-4-release-update",
+        "share-terminal-with-croc-ssh"
+      ],
+      "keywords": [
+        "croc v11.5",
+        "croc release notes",
+        "croc update",
+        "croc self-update",
+        "safe software updates",
+        "croc ssh",
+        "shared terminal",
+        "SSH reconnect"
+      ],
+      "image": "/blog/images/croc-v11-5-release-update.webp",
+      "socialImage": "/blog/images/croc-v11-5-release-update.jpg",
+      "imageAlt": "Three black-and-white panels show a version check, a verified standalone update, and a shared SSH terminal ending clearly in croc v11.5."
+    },
+    {
+      "slug": "croc-v11-4-release-update",
+      "title": "croc v11.4 shares the terminal",
+      "seoTitle": "croc v11.4: Secure Terminal Sharing from CLI and Browser",
+      "description": "croc v11.4 adds secure collaborative terminals, separate read/write and read-only invitations, automatic reconnection, and browser joining.",
+      "kind": "update",
+      "category": "Release notes",
+      "publishedAt": "2026-09-03",
+      "modifiedAt": "2026-09-03",
+      "wordCount": 774,
+      "readingMinutes": 4,
+      "relatedSlugs": [
+        "share-terminal-with-croc-ssh",
+        "croc-v11-3-release-update"
+      ],
+      "keywords": [
+        "croc v11.4",
+        "croc release notes",
+        "croc ssh",
+        "shared terminal",
+        "collaborative terminal",
+        "browser SSH client",
+        "read-only terminal sharing",
+        "remote pair programming"
+      ],
+      "image": "/blog/images/croc-v11-4-release-update.webp",
+      "socialImage": "/blog/images/croc-v11-4-release-update.jpg",
+      "imageAlt": "Three black-and-white panels show native terminal hosting, browser joining, and separate read/write and read-only roles in croc v11.4."
+    },
+    {
+      "slug": "share-terminal-with-croc-ssh",
+      "title": "Share a terminal with croc ssh",
+      "seoTitle": "croc v11.4 SSH: Share a Terminal with a Six-Word Code",
+      "description": "croc ssh turns a six-word invitation into one shared terminal with read/write or read-only access from the CLI or browser.",
+      "category": "Remote terminals",
+      "publishedAt": "2026-09-03",
+      "modifiedAt": "2026-09-03",
+      "wordCount": 1138,
+      "readingMinutes": 6,
+      "relatedSlugs": [
+        "croc-v11-4-release-update",
+        "pake-step-by-step"
+      ],
+      "keywords": [
+        "croc v11.4",
+        "croc ssh",
+        "shared terminal",
+        "collaborative terminal",
+        "tmate alternative",
+        "remote pair programming",
+        "read-only terminal sharing",
+        "browser SSH client",
+        "Tailcat",
+        "PAKE"
+      ],
+      "image": "/blog/images/share-terminal-with-croc-ssh.webp",
+      "socialImage": "/blog/images/share-terminal-with-croc-ssh.jpg",
+      "imageAlt": "Three black-and-white panels show one host shell, a shared PTY, and separate read/write and read-only invitations."
+    },
+    {
+      "slug": "croc-v11-3-release-update",
+      "title": "croc v11.3 goes peer-to-peer",
+      "seoTitle": "croc v11.3: Tailcat WireGuard, DERP, and Relay Fallback",
+      "description": "croc v11.3 adds PAKE-bound Tailcat WireGuard streams, promotes them directly with magicsock, uses DERP as fallback, and retains croc relays.",
+      "kind": "update",
+      "category": "Release notes",
+      "publishedAt": "2026-08-24",
+      "modifiedAt": "2026-08-24",
+      "wordCount": 1450,
+      "readingMinutes": 7,
+      "relatedSlugs": [
+        "croc-v11-release-update",
+        "how-croc-moves-a-file"
+      ],
+      "keywords": [
+        "croc v11.3",
+        "croc release notes",
+        "peer-to-peer file transfer",
+        "DERP file transfer",
+        "WireGuard file transfer",
+        "UDP hole punching",
+        "Tailscale DERP",
+        "command-line file transfer"
+      ],
+      "image": "/blog/images/croc-v11-3-release-update.webp",
+      "socialImage": "/blog/images/croc-v11-3-release-update.jpg",
+      "imageAlt": "Three black-and-white panels show Tailcat direct transport, public DERP fallback, and the established croc relay path."
+    },
+    {
+      "slug": "croc-cli-speed-comparison",
+      "title": "How fast is croc?",
+      "seoTitle": "croc Speed Test: Eight CLI File-Transfer Tools Compared",
+      "description": "I timed eight command-line file-transfer tools between two servers using a 303 MB audio file and a folder of 64 photos.",
+      "category": "Benchmarks",
+      "publishedAt": "2026-08-23",
+      "modifiedAt": "2026-08-23",
+      "wordCount": 1127,
+      "readingMinutes": 6,
+      "relatedSlugs": [
+        "compare-file-transfer-tools",
+        "how-croc-moves-a-file"
+      ],
+      "keywords": [
+        "croc speed test",
+        "CLI file transfer benchmark",
+        "croc vs Magic Wormhole",
+        "croc vs Sendme",
+        "WebWormhole speed",
+        "Floe speed",
+        "AirPipe speed",
+        "derphole speed",
+        "wormhole-william speed",
+        "file transfer protocol",
+        "WebRTC file transfer",
+        "QUIC file transfer",
+        "command-line file transfer"
+      ],
+      "image": "/blog/images/croc-cli-speed-comparison.webp",
+      "socialImage": "/blog/images/croc-cli-speed-comparison.jpg",
+      "imageAlt": "Two terminal windows exchange an audio file across the United States while a stopwatch measures the transfer."
+    },
     {
       "slug": "croc-v11-release-update",
       "title": "From croc v10 to v11",
@@ -249,14 +400,14 @@
     },
     {
       "slug": "compare-file-transfer-tools",
-      "title": "36 ways to send a file",
-      "seoTitle": "36 Ways to Send a File: croc and 35 Alternatives",
-      "description": "Compare croc with 35 file transfer tools by resume support, account requirements, browser and CLI transfers, encryption, availability, and transfer paths.",
+      "title": "40 ways to send a file",
+      "seoTitle": "40 Ways to Send a File: croc and 39 Alternatives",
+      "description": "Compare croc with 39 file transfer tools by resume support, account requirements, browser and CLI transfers, encryption, availability, and transfer paths.",
       "category": "Field guide",
       "publishedAt": "2026-08-12",
-      "modifiedAt": "2026-08-12",
-      "wordCount": 2244,
-      "readingMinutes": 11,
+      "modifiedAt": "2026-08-23",
+      "wordCount": 2347,
+      "readingMinutes": 12,
       "relatedSlugs": [
         "browser-meets-terminal",
         "send-file-from-browser"
@@ -269,7 +420,11 @@
         "secure file transfer",
         "peer-to-peer file transfer",
         "cross-platform file sharing",
-        "no account file transfer"
+        "no account file transfer",
+        "derphole file transfer",
+        "wormhole-william",
+        "Floe file transfer",
+        "AirPipe file transfer"
       ],
       "image": "/blog/images/compare-file-transfer-tools.webp",
       "socialImage": "/blog/images/compare-file-transfer-tools.jpg",

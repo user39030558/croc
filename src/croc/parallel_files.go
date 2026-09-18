@@ -16,12 +16,12 @@ import (
 	"time"
 
 	"github.com/denisbrodbeck/machineid"
-	log "github.com/schollz/logger"
 	"github.com/schollz/progressbar/v3"
 
 	"github.com/schollz/croc/v11/src/comm"
 	"github.com/schollz/croc/v11/src/compress"
 	"github.com/schollz/croc/v11/src/crypt"
+	log "github.com/schollz/croc/v11/src/logger"
 	"github.com/schollz/croc/v11/src/message"
 	"github.com/schollz/croc/v11/src/models"
 	"github.com/schollz/croc/v11/src/termui"
@@ -46,10 +46,7 @@ func splitParallelFileJobs(fileIndex int, chunkRanges []int64, fileSize, targetB
 	if targetBytes < chunkSize {
 		targetBytes = chunkSize
 	}
-	targetChunks := targetBytes / chunkSize
-	if targetChunks < 1 {
-		targetChunks = 1
-	}
+	targetChunks := max(targetBytes/chunkSize, 1)
 
 	ranges := chunkRanges
 	if len(ranges) == 0 {
@@ -74,10 +71,7 @@ func splitParallelFileJobs(fileIndex int, chunkRanges []int64, fileSize, targetB
 				flush()
 				capacity = targetChunks
 			}
-			take := count
-			if take > capacity {
-				take = capacity
-			}
+			take := min(count, capacity)
 			current = append(current, start, take)
 			currentChunks += take
 			start += take * chunkSize
@@ -508,11 +502,8 @@ func (c *Client) initializeParallelFileTransfers() error {
 	if c.peerHybridChunks {
 		return c.initializeHybridFileTransfers(pending)
 	}
-	workers := len(c.Options.RelayPorts)
-	if workers > len(pending) {
-		workers = len(pending)
-	}
-	for connectionIndex := 0; connectionIndex < workers; connectionIndex++ {
+	workers := min(len(c.Options.RelayPorts), len(pending))
+	for connectionIndex := range workers {
 		if err := c.startParallelReceiverFile(connectionIndex); err != nil {
 			return err
 		}
@@ -567,7 +558,7 @@ func (c *Client) initializeHybridFileTransfers(pending []int) error {
 
 func (c *Client) scheduleHybridReceiverConnections() error {
 	workers := len(c.Options.RelayPorts)
-	for connectionIndex := 0; connectionIndex < workers; connectionIndex++ {
+	for connectionIndex := range workers {
 		c.fileTransferMu.Lock()
 		_, busy := c.receiveTransfers[connectionIndex]
 		c.fileTransferMu.Unlock()
@@ -1282,7 +1273,7 @@ func (c *Client) sendParallelFileData(state *fileTransferState, dataConn *comm.C
 	}
 	for index := 1; index+1 < len(state.chunkRanges); index += 2 {
 		start, count := state.chunkRanges[index], state.chunkRanges[index+1]
-		for chunk := int64(0); chunk < count; chunk++ {
+		for chunk := range count {
 			position := start + chunk*rangeChunkSize
 			if position >= fileSize {
 				break

@@ -1,4 +1,5 @@
-import { useEffect, useState } from "react";
+import { type ReactNode, useEffect, useState } from "react";
+import crocIllustration from "./assets/croc.jpg?inline";
 import {
   ArrowLeft,
   ArrowRight,
@@ -6,6 +7,7 @@ import {
   Check,
   Circle,
   Clock3,
+  Eye,
   FileText,
   KeyRound,
   Laptop,
@@ -26,6 +28,7 @@ import {
   getBlogPost,
   type BlogBlock,
   type BlogPost,
+  type BlogTextLink,
   type BlogVisual,
 } from "./blog-posts";
 import blogSEO from "./blog-seo.json";
@@ -390,7 +393,7 @@ function BlogHeader() {
       <div className="blog-site-header-inner">
         <a className="blog-brand" href="/blog" aria-label="croc field notes home">
           <img
-            src="/croc.jpg"
+            src={crocIllustration}
             width="408"
             height="196"
             alt=""
@@ -580,6 +583,98 @@ function ReleaseVisual() {
   );
 }
 
+function DERPVisual() {
+  return (
+    <div className="derp-visual">
+      <span>
+        <ArrowRight />
+        <small>Tailcat direct</small>
+        <strong>peer to peer</strong>
+      </span>
+      <span>
+        <RadioTower />
+        <small>public DERP</small>
+        <strong>fallback</strong>
+      </span>
+      <span>
+        <ShieldCheck />
+        <small>croc relay</small>
+        <strong>still works</strong>
+      </span>
+      <i>croc v11.3 · direct when possible · relay when needed</i>
+    </div>
+  );
+}
+
+function SSHVisual() {
+  return (
+    <div className="ssh-visual">
+      <span>
+        <Terminal />
+        <small>host machine</small>
+        <strong>one shell</strong>
+      </span>
+      <span>
+        <Users />
+        <small>six-word invites</small>
+        <strong>shared PTY</strong>
+      </span>
+      <span>
+        <Eye />
+        <small>separate codes</small>
+        <strong>two roles</strong>
+      </span>
+      <i>read/write or read-only · detach and reconnect</i>
+    </div>
+  );
+}
+
+function SSHReleaseVisual() {
+  return (
+    <div className="ssh-release-visual">
+      <span>
+        <Terminal />
+        <small>native CLI</small>
+        <strong>host + join</strong>
+      </span>
+      <span>
+        <Laptop />
+        <small>getcroc.com</small>
+        <strong>browser join</strong>
+      </span>
+      <span>
+        <Users />
+        <small>separate invites</small>
+        <strong>two roles</strong>
+      </span>
+      <i>croc v11.4 · one terminal · more ways to join</i>
+    </div>
+  );
+}
+
+function UpdateReleaseVisual() {
+  return (
+    <div className="update-release-visual">
+      <span>
+        <Check />
+        <small>version check</small>
+        <strong>check first</strong>
+      </span>
+      <span>
+        <ShieldCheck />
+        <small>verified release</small>
+        <strong>replace safely</strong>
+      </span>
+      <span>
+        <Terminal />
+        <small>shared SSH</small>
+        <strong>clearer endings</strong>
+      </span>
+      <i>croc v11.5 · updates you control · sharing that explains itself</i>
+    </div>
+  );
+}
+
 function BlogVisualCard({ visual, large = false }: { visual: BlogVisual; large?: boolean }) {
   return (
     <div className={`blog-visual blog-visual-${visual}${large ? " large" : ""}`} aria-hidden="true">
@@ -590,13 +685,23 @@ function BlogVisualCard({ visual, large = false }: { visual: BlogVisual; large?:
       {visual === "browser" ? <BrowserVisual /> : null}
       {visual === "bridge" ? <BridgeVisual /> : null}
       {visual === "stored" ? <StoredVisual /> : null}
+      {visual === "derp" ? <DERPVisual /> : null}
+      {visual === "ssh" ? <SSHVisual /> : null}
+      {visual === "ssh-release" ? <SSHReleaseVisual /> : null}
+      {visual === "update-release" ? <UpdateReleaseVisual /> : null}
       {visual === "release" ? <ReleaseVisual /> : null}
     </div>
   );
 }
 
 function BlogCoverImage({ post }: { post: BlogPost }) {
-  if (post.visual === "release") {
+  if (
+    post.visual === "release" ||
+    post.visual === "derp" ||
+    post.visual === "ssh" ||
+    post.visual === "ssh-release" ||
+    post.visual === "update-release"
+  ) {
     return (
       <figure
         className="blog-article-cover blog-article-visual-cover"
@@ -678,7 +783,9 @@ function BlogIndex() {
               <p className="blog-kicker"><FileText /> Updates</p>
               <h2 id="updates-title">What changed in croc</h2>
             </div>
-            <span>{String(updates.length).padStart(2, "0")} update</span>
+            <span>
+              {String(updates.length).padStart(2, "0")} {updates.length === 1 ? "update" : "updates"}
+            </span>
           </div>
           <div className="blog-updates-list">
             {updates.map((post) => (
@@ -871,6 +978,34 @@ function TableStatusIndicator({
   );
 }
 
+function BlogRichText({
+  text,
+  links,
+}: {
+  text: string;
+  links?: BlogTextLink[];
+}) {
+  if (!links?.length) return text;
+
+  const content: ReactNode[] = [];
+  let cursor = 0;
+  links.forEach((link) => {
+    const linkStart = text.indexOf(link.label, cursor);
+    if (linkStart < 0) return;
+
+    if (linkStart > cursor) content.push(text.slice(cursor, linkStart));
+    content.push(
+      <a href={link.href} key={`${link.href}-${linkStart}`}>
+        {link.label}
+      </a>,
+    );
+    cursor = linkStart + link.label.length;
+  });
+  if (cursor < text.length) content.push(text.slice(cursor));
+
+  return content;
+}
+
 function BlogBlockView({ block, index }: { block: BlogBlock; index: number }) {
   if (block.type === "heading") {
     return <h2 id={headingID(block.text, index)}>{block.text}</h2>;
@@ -886,12 +1021,20 @@ function BlogBlockView({ block, index }: { block: BlogBlock; index: number }) {
       </figure>
     );
   }
+  if (block.type === "details") {
+    return (
+      <details className="blog-code-details">
+        <summary>{block.summary}</summary>
+        <pre><code>{block.lines.join("\n")}</code></pre>
+      </details>
+    );
+  }
   if (block.type === "aside") {
     return (
       <aside className="blog-callout">
         <span>{block.eyebrow}</span>
         <h3>{block.title}</h3>
-        <p>{block.text}</p>
+        <p><BlogRichText text={block.text} links={block.links} /></p>
       </aside>
     );
   }
@@ -1050,7 +1193,7 @@ function BlogBlockView({ block, index }: { block: BlogBlock; index: number }) {
       </div>
     );
   }
-  return <p>{block.text}</p>;
+  return <p><BlogRichText text={block.text} links={block.links} /></p>;
 }
 
 function BlogArticle({ post }: { post: BlogPost }) {

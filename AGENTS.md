@@ -1,5 +1,23 @@
 # Repository instructions
 
+## Version control with Git
+
+Use Git for all version-control operations.
+
+When explicitly asked to push changes, use the repository workflow helper with
+a semantic/conventional commit message:
+
+```bash
+~/dotfiles/git-pr '<commit message>'
+```
+
+For example, use messages such as `fix: handle interrupted transfers` or
+`feat: add configurable relay timeouts`. Do not run `git push` directly; the
+helper owns the commit, push, and pull-request workflow.
+
+GitHub Actions and release operations continue to use the GitHub CLI (`gh`) as
+documented below.
+
 ## Releasing croc
 
 Releases are prepared by the **Prepare Release** GitHub Actions workflow. Do not
@@ -53,16 +71,18 @@ After correcting a transient problem, either run
 `gh run rerun "${RELEASE_RUN_ID}" --failed` or dispatch the same tag again. A
 rerun is permitted only while the release is absent or still a draft.
 
-After a successful run, verify that the release is a draft and contains 22
+After a successful run, verify that the release is a draft and contains 34
 assets: 19 `croc` platform archives, the `croc-web` archive, the source archive,
-and the checksum file.
+the twelve Linux DEB/RPM packages, and the checksum file.
 
 ```bash
 gh release view "${RELEASE_TAG}" --json isDraft,url,assets \
   --jq '{isDraft: .isDraft, url: .url, assets: [.assets[].name]}'
 test "$(gh release view "${RELEASE_TAG}" --json isDraft --jq .isDraft)" = true
-test "$(gh release view "${RELEASE_TAG}" --json assets --jq '.assets | length')" -eq 22
+test "$(gh release view "${RELEASE_TAG}" --json assets --jq '.assets | length')" -eq 34
 ```
+
+Download the draft assets and run `python3 packaging/release.py verify-assets --version "${RELEASE_TAG}" --artifacts DIRECTORY` to validate their exact names and checksums.
 
 Review the generated notes and asset names before publishing. Publishing is the
 point that triggers the Docker workflow:
@@ -74,5 +94,5 @@ gh run list --workflow deploy.yml --limit 3 \
 ```
 
 Use `gh run watch RUN_ID --exit-status` to follow the downstream run. Never use
-`gh release create` or `git tag` for this release flow. The Prepare Release
-workflow owns the version commit, tag, artifacts, and draft.
+`gh release create` or manually create or move the release tag with Git. The
+Prepare Release workflow owns the version commit, tag, artifacts, and draft.

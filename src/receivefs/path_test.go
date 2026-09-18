@@ -2,6 +2,7 @@ package receivefs
 
 import (
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -35,16 +36,59 @@ func TestNormalizeProducesPortableNFCPaths(t *testing.T) {
 	}
 }
 
+func TestNormalizeRejectsSensitiveComponents(t *testing.T) {
+	rejected := []string{
+		".ssh",
+		".SSH/authorized_keys",
+		"safe/.git/hooks/post-checkout",
+		"safe/.GnUpG/private-keys-v1.d/key",
+	}
+	for _, value := range rejected {
+		t.Run(value, func(t *testing.T) {
+			if _, err := Normalize(value, false); !errors.Is(err, ErrSensitivePath) {
+				t.Fatalf("Normalize(%q) error = %v, want ErrSensitivePath", value, err)
+			}
+		})
+	}
+
+	allowed := []string{".ssh-backup", "my.ssh", "safe/ssh", ".git-backup", "my.git"}
+	for _, value := range allowed {
+		t.Run("allowed/"+value, func(t *testing.T) {
+			if _, err := Normalize(value, false); err != nil {
+				t.Fatalf("Normalize(%q) error = %v", value, err)
+			}
+		})
+	}
+}
+
 func TestValidateEntriesRejectsPortableCollisions(t *testing.T) {
 	tests := [][]Entry{
 		{{Path: "README", Kind: KindFile}, {Path: "readme", Kind: KindFile}},
 		{{Path: "é.txt", Kind: KindFile}, {Path: "e\u0301.txt", Kind: KindFile}},
 		{{Path: "parent", Kind: KindFile}, {Path: "parent/child", Kind: KindFile}},
+		{{Path: "parent/child", Kind: KindFile}, {Path: "parent", Kind: KindFile}},
+		{{Path: "link/child", Kind: KindFile}, {Path: "link", Kind: KindSymlink}},
+		{{Path: "link", Kind: KindSymlink}, {Path: "link/child", Kind: KindFile}},
+		{{Path: "Parent", Kind: KindFile}, {Path: "parent/child", Kind: KindFile}},
+		{{Path: "é", Kind: KindSymlink}, {Path: "e\u0301/child", Kind: KindFile}},
 		{{Path: "same", Kind: KindDirectory}, {Path: "same", Kind: KindFile}},
 	}
 	for _, entries := range tests {
 		if _, err := ValidateEntries(entries); !errors.Is(err, ErrPathCollision) {
 			t.Fatalf("ValidateEntries(%+v) error = %v, want collision", entries, err)
+		}
+	}
+}
+
+func BenchmarkValidateEntries200K(b *testing.B) {
+	entries := make([]Entry, 200_000)
+	for i := range entries {
+		entries[i] = Entry{Path: fmt.Sprintf("folder/file-%06d", i), Kind: KindFile}
+	}
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := ValidateEntries(entries); err != nil {
+			b.Fatal(err)
 		}
 	}
 }

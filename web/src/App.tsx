@@ -1,4 +1,13 @@
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import {
+  lazy,
+  Suspense,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
+import { flushSync } from "react-dom";
 import {
   AlertTriangle,
   ArrowRight,
@@ -12,11 +21,13 @@ import {
   MessageSquareText,
   Moon,
   Settings2,
+  SquareTerminal,
   Sun,
   Upload,
   X,
 } from "lucide-react";
 import { FaGithub } from "react-icons/fa";
+import crocIllustration from "./assets/croc.jpg?inline";
 import { driver, type DriveStep, type Driver } from "driver.js";
 import {
   trackTransferEvent,
@@ -93,13 +104,116 @@ import {
   type GitHubRelease,
 } from "./releases";
 import { blogPosts } from "./blog-posts";
-import { TransferLinks } from "./TransferLinks";
 
 type Activity = "idle" | "working" | "done" | "error";
 type Theme = "dark" | "light";
 type CopyState = "idle" | "copied" | "error";
 type MobileTransferPanel = "send" | "receive";
 type SendContent = "files" | "text";
+type WorkspaceMode = "files" | "ssh";
+
+const sshWorkspaceHash = "#ssh";
+
+export function workspaceModeFromHash(
+  hash = window.location.hash,
+): WorkspaceMode {
+  return hash.split("?", 1)[0] === sshWorkspaceHash ? "ssh" : "files";
+}
+
+export function sshInvitationFromHash(hash = window.location.hash) {
+  if (workspaceModeFromHash(hash) !== "ssh") return "";
+  const queryAt = hash.indexOf("?");
+  if (queryAt < 0) return "";
+  return new URLSearchParams(hash.slice(queryAt + 1)).get("code")?.trim() ?? "";
+}
+
+function scrubSSHInvitationFromURL() {
+  if (!sshInvitationFromHash()) return;
+  const url = new URL(window.location.href);
+  url.hash = sshWorkspaceHash;
+  window.history.replaceState(window.history.state, "", url);
+}
+
+export function useWorkspaceMode() {
+  const [mode, setMode] = useState<WorkspaceMode>(() => workspaceModeFromHash());
+  const [sshInvitation, setSSHInvitation] = useState(() =>
+    sshInvitationFromHash(),
+  );
+
+  useEffect(() => {
+    const syncModeFromURL = () => {
+      setMode(workspaceModeFromHash());
+      setSSHInvitation(sshInvitationFromHash());
+      scrubSSHInvitationFromURL();
+    };
+    window.addEventListener("hashchange", syncModeFromURL);
+    scrubSSHInvitationFromURL();
+    return () => {
+      window.removeEventListener("hashchange", syncModeFromURL);
+    };
+  }, []);
+
+  function changeMode(nextMode: WorkspaceMode) {
+    setMode(nextMode);
+    setSSHInvitation("");
+
+    const url = new URL(window.location.href);
+    if (nextMode === "ssh") {
+      url.hash = sshWorkspaceHash;
+    } else if (url.hash === sshWorkspaceHash) {
+      url.hash = "";
+    } else {
+      return;
+    }
+
+    if (url.href !== window.location.href) {
+      window.history.pushState(null, "", url);
+    }
+  }
+
+  return [mode, changeMode, sshInvitation] as const;
+}
+
+const SSHPanel = lazy(() => import("./SSHPanel"));
+
+export function WorkspaceSwitch({
+  mode,
+  disabled,
+  onChange,
+}: {
+  mode: WorkspaceMode;
+  disabled: boolean;
+  onChange(mode: WorkspaceMode): void;
+}) {
+  return (
+    <div
+      className="workspace-switch"
+      role="tablist"
+      aria-label="Choose croc tool"
+    >
+      <button
+        type="button"
+        role="tab"
+        data-tour="files"
+        aria-selected={mode === "files"}
+        disabled={disabled}
+        onClick={() => onChange("files")}
+      >
+        <Upload aria-hidden="true" /> Files
+      </button>
+      <button
+        type="button"
+        role="tab"
+        data-tour="ssh"
+        aria-selected={mode === "ssh"}
+        disabled={disabled}
+        onClick={() => onChange("ssh")}
+      >
+        <SquareTerminal aria-hidden="true" /> SSH
+      </button>
+    </div>
+  );
+}
 
 function sendHashAlgorithm(mode: SendMode): FileHashAlgorithm {
   return mode === "stored" ? "sha256" : "xxhash";
@@ -597,8 +711,8 @@ function BlogTeaser() {
           <p className="eyebrow">Notes &amp; updates</p>
           <h2 id="home-blog-title">What happens after you press Send?</h2>
           <p>
-            Plainspoken notes about the relay, the three-word code, and the ways
-            browsers and terminals meet, plus updates when croc changes.
+            Notes about how croc works, commonly asked questions about croc,
+            and latest information on new updates to croc.
           </p>
         </div>
         <a href="/blog">Read all {blogPosts.length} posts <ArrowRight /></a>
@@ -606,7 +720,6 @@ function BlogTeaser() {
       <div className="home-blog-list">
         {blogPosts.slice(0, 3).map((post) => (
           <a href={`/blog/${post.slug}`} key={post.slug}>
-            <span>{post.number}</span>
             <strong>{post.title}</strong>
             <small>{post.readingMinutes} min read</small>
             <ArrowRight aria-hidden="true" />
@@ -696,6 +809,8 @@ export function App() {
   );
   const [mobileTransferPanel, setMobileTransferPanel] =
     useState<MobileTransferPanel>(receiveOnly ? "receive" : "send");
+  const [workspaceMode, setWorkspaceMode, sshInvitation] = useWorkspaceMode();
+  const [sshActive, setSSHActive] = useState(false);
   const [sendCode, setSendCode] = useState("");
   const [sendDetailsVisible, setSendDetailsVisible] = useState(false);
   const [sendActivity, setSendActivity] = useState<Activity>("idle");
@@ -835,6 +950,35 @@ export function App() {
     void startReceive();
     return () => receiveAbort.current?.abort();
   }, []);
+
+  useEffect(() => {
+    if (sendActivity !== "working" && receiveActivity !== "working") return;
+    let sentinel: WakeLockSentinel | undefined;
+    let cancelled = false;
+
+    async function acquireWakeLock() {
+      if (cancelled || document.visibilityState !== "visible") return;
+      if (sentinel && !sentinel.released) return;
+      try {
+        sentinel = await navigator.wakeLock?.request("screen");
+        sentinel?.addEventListener("release", () => {
+          if (!cancelled) void acquireWakeLock();
+        });
+      } catch {}
+    }
+
+    function onVisibility() {
+      if (document.visibilityState === "visible") void acquireWakeLock();
+    }
+
+    void acquireWakeLock();
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => {
+      cancelled = true;
+      document.removeEventListener("visibilitychange", onVisibility);
+      void sentinel?.release().catch(() => {});
+    };
+  }, [sendActivity, receiveActivity]);
 
   useLayoutEffect(() => {
     if (requestedReceiveCode) {
@@ -1209,6 +1353,7 @@ export function App() {
 
   function startTour() {
     tour.current?.destroy();
+    const sshTour = !receiveOnly && workspaceMode === "ssh";
 
     const steps: DriveStep[] = [
       {
@@ -1218,53 +1363,111 @@ export function App() {
             ? requestedStoredURL
               ? "This encrypted stored link is opening its manifest. Review the incoming files, then choose where to save them before claiming an allowed download."
               : "This receive link already filled its croc code and started connecting. You only need to review the incoming files and choose where to save them."
-            : "Send or receive files from this page with any compatible croc browser or command-line peer. This tour shows the complete flow.",
+            : sshTour
+              ? "Join a shared croc terminal from your browser. This tour explains invitations, access, and how to return to file transfers."
+              : "Use Files to send and receive with a croc browser or command-line peer, or SSH to join a shared terminal. This tour walks through the controls on this page.",
         },
       },
     ];
 
-    if (!receiveOnly) {
+    if (!receiveOnly && !sshTour) {
       steps.push({
         element: '[data-tour="send"]',
         popover: {
           title: "Send one or several files",
-          description: `Use Direct for a live croc-code transfer, or Store for an encrypted link that lasts ${formatStoredExpiration(
-            storedExpiration.value,
-            storedExpiration.unit,
-          )} or until its configured verified-download limit. Choose files or drag them here to begin; Direct also has a secondary option for short text.`,
+          description:
+            (storeEnabled ? "Choose Direct for a live transfer. " : "") +
+            "Choose files or drag them here, then press Send file. Share the croc code, browser link, or QR code with your receiver. Keep this page open until the transfer finishes; both peers need to be online. Use Send text instead for a short message or URL.",
           side: "right",
           align: "start",
         },
       });
+
+      if (storeEnabled) {
+        steps.push({
+          element: '[data-tour="store"]',
+          popover: {
+            title: "Store now, download later",
+            description:
+              "Choose Store to upload encrypted files so the receiver can download later, even after you close this page. Set the expiration and verified-download allowance, then press Store file and wait for the upload to finish. Share the browser link, QR code, or CLI token. Files are deleted when the time or download allowance runs out, whichever comes first; Revoke now removes them sooner. Store accepts files; text uses Direct.",
+            side: "right",
+            align: "start",
+          },
+        });
+      }
     }
 
-    steps.push(
-      {
-        element: '[data-tour="receive"]',
-        popover: {
-          title: "Receive and review",
-          description:
-            "Paste the sender’s croc code, encrypted browser link, or CLI token. Review incoming files or text before choosing whether to save, display, or refuse it.",
-          side: receiveOnly ? "top" : "left",
-          align: "start",
+    if (!sshTour) {
+      steps.push(
+        {
+          element: '[data-tour="receive"]',
+          popover: {
+            title: "Receive and review",
+            description:
+              "Paste the sender’s croc code, encrypted browser link, or CLI token. Review incoming files or text before choosing whether to save, display, or refuse it.",
+            side: receiveOnly ? "top" : "left",
+            align: "start",
+          },
         },
-      },
-      {
-        element: ".transfer-grid",
+        {
+          element: ".transfer-grid",
+          popover: {
+            title: "The code or link provides the key",
+            description:
+              "Direct transfers use password-authenticated key exchange (PAKE) so both peers derive a strong shared key from the croc code. Stored links carry a separate random key after #, which is not sent to the server. File metadata and chunks are encrypted before leaving the browser.",
+            side: "bottom",
+            align: "start",
+          },
+        },
+      );
+    }
+
+    if (!receiveOnly) {
+      steps.push({
+        element: sshTour ? ".ssh-workspace" : '[data-tour="ssh"]',
         popover: {
-          title: "The code or link provides the key",
+          title: "SSH: join a shared terminal",
           description:
-            "Direct transfers use password-authenticated key exchange (PAKE) so both peers derive a strong shared key from the croc code. Stored links carry a separate random key after #, which is not sent to the server. File metadata and chunks are encrypted before leaving the browser.",
+            "The host starts a terminal with <code>croc ssh</code> and shares a browser link or six-word invitation. Open their link, or select SSH, paste the invitation, and press Join terminal. A read/write invitation lets you type; a read-only invitation lets you watch. Everyone sees the same terminal. The browser joins croc sessions; it cannot host a shell or connect to an arbitrary SSH server.",
           side: "bottom",
           align: "start",
         },
-      },
+      });
+
+      if (sshTour) {
+        steps.push(
+          {
+            element: ".ssh-workspace",
+            popover: {
+              title: "Your invitation sets your access",
+              description:
+                "The connection is encrypted end-to-end. Share invitations only with people you trust: read/write guests use the host account’s privileges, and read-only guests can see terminal output. Disconnect or Ctrl-] leaves the session; Ctrl-C is sent to the shared shell. The host can stop the session to revoke both invitations.",
+              side: "bottom",
+              align: "start",
+            },
+          },
+          {
+            element: '[data-tour="files"]',
+            popover: {
+              title: "Switch to Files for transfers",
+              description: storeEnabled
+                ? "After disconnecting, choose Files to send files or short text live with Direct, upload encrypted files for later with Store, or receive a croc code or stored link. Store lets you choose an expiration and verified-download allowance; files are deleted when either limit is reached."
+                : "After disconnecting, choose Files to send files or short text with a croc code, or receive from another browser or command-line peer. Keep both peers online until a live transfer finishes.",
+              side: "bottom",
+              align: "start",
+            },
+          },
+        );
+      }
+    }
+
+    steps.push(
       {
         element: '[data-tour="settings"]',
         popover: {
           title: "Use another relay when needed",
           description:
-            "Most people can leave these advanced settings alone. Self-hosted setups can select their own WebSocket gateway, croc relay, and relay password.",
+            "The defaults work for most people. Expand Relay settings to change the WebSocket gateway or relay password for a self-hosted setup. CLI relay addresses are supplied by this server and shown here for reference. For SSH, the browser and host must use the same relay pool and password.",
           side: "top",
           align: "start",
         },
@@ -1274,7 +1477,7 @@ export function App() {
         popover: {
           title: "Works with the croc CLI",
           description:
-            "Direct browser transfers interoperate with normal croc command-line clients, and stored transfers include a pasteable CLI token. Download the detected build here, or choose another release from GitHub.",
+            "Download croc for your detected platform here, or use Other releases to choose a build on GitHub. The CLI works with browser transfers: <code>croc send</code> sends files live, <code>croc store</code> creates encrypted stored links, and <code>croc ssh</code> hosts a shared terminal. Paste a stored CLI token into the prompt after running <code>croc</code> to receive it.",
           side: "top",
           align: "start",
         },
@@ -1284,7 +1487,7 @@ export function App() {
         popover: {
           title: "Read the field notes",
           description:
-            "Plainspoken notes explain the relay, PAKE, encryption, browser and terminal interoperability, stored sharing, and the decisions behind croc.",
+            "Browse Notes &amp; updates for walkthroughs of browser transfers, stored sharing, shared terminals, PAKE, and encryption, plus the latest croc release notes. The book icon beside Help also opens the blog.",
           side: "top",
           align: "start",
         },
@@ -1307,8 +1510,18 @@ export function App() {
       allowKeyboardControl: true,
       disableActiveInteraction: true,
       skipMissingElement: true,
+      onHighlightStarted: (element) => {
+        const panel = element
+          ?.closest('[data-tour="send"], [data-tour="receive"]')
+          ?.getAttribute("data-tour");
+        if (panel === "send" || panel === "receive") {
+          // Reveal the mobile tab before Driver measures its target.
+          flushSync(() => setMobileTransferPanel(panel));
+        }
+      },
       onDestroyed: () => {
         tour.current = undefined;
+        setMobileTransferPanel(mobileTransferPanel);
       },
     });
     tour.current.drive();
@@ -1345,7 +1558,7 @@ export function App() {
         <a className="brand-link" href="/" aria-label="Go to croc home">
           <img
             className="brand-illustration"
-            src="/croc.jpg"
+            src={crocIllustration}
             width="408"
             height="196"
             alt="Hand-drawn green crocodile floating in blue water"
@@ -1358,10 +1571,22 @@ export function App() {
           <h1>
             {receiveOnly
               ? "Receive files, secured end-to-end."
-              : "Send files, secured end-to-end."}
+              : workspaceMode === "ssh"
+                ? "Join a terminal, secured end-to-end."
+                : "Send files, secured end-to-end."}
           </h1>
         </div>
-        <div className="header-actions">
+      </header>
+
+      <div className="workspace-toolbar" aria-label="Workspace controls">
+        {!receiveOnly && (
+          <WorkspaceSwitch
+            mode={workspaceMode}
+            disabled={sendBusy || receiveBusy || sshActive}
+            onChange={setWorkspaceMode}
+          />
+        )}
+        <div className="workspace-toolbar-actions">
           <button
             className="icon-button"
             type="button"
@@ -1393,6 +1618,7 @@ export function App() {
             className="icon-button theme-toggle"
             type="button"
             aria-label={`Switch to ${theme === "dark" ? "light" : "dark"} mode`}
+            title={`Switch to ${theme === "dark" ? "light" : "dark"} mode`}
             onClick={() =>
               setTheme((current) => (current === "dark" ? "light" : "dark"))
             }
@@ -1400,13 +1626,14 @@ export function App() {
             {theme === "dark" ? <Sun /> : <Moon />}
           </button>
         </div>
-      </header>
+      </div>
 
-      <section
-        ref={transferGrid}
-        className={`transfer-grid${receiveOnly ? " receive-only" : ""}`}
-        aria-label="File transfer controls"
-      >
+      {(receiveOnly || workspaceMode === "files") && (
+        <section
+          ref={transferGrid}
+          className={`transfer-grid${receiveOnly ? " receive-only" : ""}`}
+          aria-label="File transfer controls"
+        >
         {!receiveOnly && (
           <div
             className="mobile-transfer-switch"
@@ -1835,7 +2062,7 @@ export function App() {
             autoCapitalize="none"
             autoCorrect="off"
             enterKeyHint="go"
-            onChange={(event) => setReceiveCode(event.target.value)}
+            onChange={(event) => setReceiveCode(event.target.value.replace(/\s+/g, '-'))}
           />
           <p className="field-help">
             Paste or type the code, stored link, or CLI token, then press Enter
@@ -2005,7 +2232,28 @@ export function App() {
               </button>
             ))}
         </form>
-      </section>
+        </section>
+      )}
+
+      {!receiveOnly && workspaceMode === "ssh" && (
+        <Suspense
+          fallback={
+            <section className="ssh-workspace" aria-live="polite">
+              <article className="panel ssh-loading">
+                Loading secure terminal…
+              </article>
+            </section>
+          }
+        >
+          <SSHPanel
+            key={sshInvitation}
+            initialCode={sshInvitation}
+            settings={settings}
+            theme={theme}
+            onActiveChange={setSSHActive}
+          />
+        </Suspense>
+      )}
 
       <details className="settings" data-tour="settings">
         <summary>
@@ -2023,7 +2271,7 @@ export function App() {
             <span>WebSocket gateway</span>
             <input
               value={settings.gatewayURL}
-              disabled={sendBusy || receiveBusy}
+              disabled={sendBusy || receiveBusy || sshActive}
               spellCheck={false}
               onChange={(event) =>
                 setSettings((current) => ({
@@ -2048,7 +2296,7 @@ export function App() {
               name="relay-password"
               autoComplete="off"
               value={settings.relayPassword}
-              disabled={sendBusy || receiveBusy}
+              disabled={sendBusy || receiveBusy || sshActive}
               onChange={(event) =>
                 setSettings((current) => ({
                   ...current,
@@ -2073,8 +2321,6 @@ export function App() {
       <BlogTeaser />
 
       {!receiveOnly && <HomeReviews />}
-
-      <TransferLinks />
 
       <footer className="site-footer">
         <div className="site-footer-links">
