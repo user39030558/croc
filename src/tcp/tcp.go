@@ -3,31 +3,35 @@ package tcp
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
 	"net"
+	"slices"
 	"strings"
 	"sync"
 	"time"
 
-	log "github.com/schollz/logger"
+	log "github.com/schollz/croc/v11/src/logger"
 	"github.com/schollz/pake/v3"
 
 	"github.com/schollz/croc/v11/src/comm"
 	"github.com/schollz/croc/v11/src/crypt"
+	"github.com/schollz/croc/v11/src/message"
 	"github.com/schollz/croc/v11/src/redact"
 )
 
 type server struct {
-	host       string
-	port       string
-	debugLevel string
-	banner     string
-	password   string
-	roomPaired func()
-	rooms      roomMap
-	started    chan struct{}
+	host         string
+	port         string
+	debugLevel   string
+	banner       string
+	password     string
+	roomPaired   func()
+	roomProtocol func(RoomProtocol)
+	rooms        roomMap
+	started      chan struct{}
 
 	maxPendingHandshakes int
 	handshakeTimeout     time.Duration
@@ -39,6 +43,7 @@ type server struct {
 	roomJoinLimit        int
 	joinLimitWindow      time.Duration
 	admissionLimits      *admissionLimiter
+	fastAdmission        *RelayCapabilitySet
 
 	// stopRoomCleanup chan struct{}
 	// replaced by stop ctx.go
@@ -69,6 +74,7 @@ type roomAdmission struct {
 type handshakeResult struct {
 	room                   string
 	strongKeyForEncryption []byte
+	fast                   bool
 }
 
 const pingRoom = "pinglkasjdlfjsaldjf"
@@ -169,11 +175,9 @@ func (s *server) start() (err error) {
 	s.handshakeSlots = make(chan struct{}, s.maxPendingHandshakes)
 	s.admissionLimits = newAdmissionLimiter(s.sourceJoinLimit, s.roomJoinLimit, s.joinLimitWindow)
 
-	s.stop.wg.Add(1)
-	go func() {
-		defer s.stop.wg.Done()
+	s.stop.wg.Go(func() {
 		s.deleteOldRooms()
-	}()
+	})
 	// defer s.stopRoomDeletion()
 	defer s.stop.Cancel()
 	if s.stop.gui {
@@ -211,11 +215,12 @@ func (s *server) run() (err error) {
 	}
 	log.Infof("starting TCP server on %s", addr)
 	lc := net.ListenConfig{}
-	s.stop.server, err = lc.Listen(s.stop.ctx, network, addr)
+	listener, err := lc.Listen(s.stop.ctx, network, addr)
 	if err != nil {
 		return fmt.Errorf("error listening on %s: %w", addr, err)
 	}
-	defer s.stop.server.Close()
+	s.stop.setServer(listener)
+	defer listener.Close()
 	close(s.started)
 
 	go func() {
@@ -233,7 +238,7 @@ func (s *server) run() (err error) {
 
 	// spawn a new goroutine whenever a client connects
 	for {
-		connection, err := s.stop.server.Accept()
+		connection, err := listener.Accept()
 		if err != nil {
 			return fmt.Errorf("problem accepting connection: %w", err)
 		}
@@ -357,9 +362,9 @@ func (s *server) deleteOldRooms() {
 			}
 			s.rooms.Unlock()
 		case <-s.stop.ctx.Done():
-			if s.server != nil {
-				log.Debugf("stop TCP server on %s", s.server.Addr())
-				s.server.Close()
+			if server := s.getServer(); server != nil {
+				log.Debugf("stop TCP server on %s", server.Addr())
+				server.Close()
 				time.Sleep(time.Millisecond)
 			}
 			log.Debug("stop room cleanup fired")
@@ -413,6 +418,15 @@ func (s *server) clientHandshake(c *comm.Comm, deadline time.Time) (result hands
 		err = send([]byte("pong"))
 		return
 	}
+	if request, ok := decodeFastAdmissionRequest(Abytes); ok {
+		if s.fastAdmission == nil {
+			return handshakeResult{}, errors.New("fast admission is unsupported")
+		}
+		if err := s.fastAdmission.verifyAndUse(canonicalSource(c.Connection().RemoteAddr()), request.Room, request.Token); err != nil {
+			return handshakeResult{}, err
+		}
+		return handshakeResult{room: request.Room, fast: true}, nil
+	}
 	err = B.Update(Abytes)
 	if err != nil {
 		return
@@ -456,13 +470,45 @@ func (s *server) clientHandshake(c *comm.Comm, deadline time.Time) (result hands
 		return handshakeResult{}, passwordErr
 	}
 
+	// New clients pipeline their room frame. Give an upgraded control port a
+	// very small window to consume it before the banner so the capability can
+	// be bound to the parent room. Legacy clients still receive their banner
+	// after this bounded wait and then send the room as before.
+	var earlyRoom []byte
+	if s.fastAdmission != nil && s.banner != "" {
+		earlyDeadline := time.Now().Add(5 * time.Millisecond)
+		if earlyDeadline.After(deadline) {
+			earlyDeadline = deadline
+		}
+		earlyRoom, err = c.ReceiveWithDeadline(earlyDeadline)
+		if err != nil {
+			if netErr, ok := err.(net.Error); !ok || !netErr.Timeout() {
+				return handshakeResult{}, err
+			}
+			err = nil
+		}
+	}
+	if len(earlyRoom) > 0 {
+		roomBytes, decryptErr := crypt.Decrypt(earlyRoom, strongKeyForEncryption)
+		if decryptErr != nil {
+			return handshakeResult{}, decryptErr
+		}
+		result.room = string(roomBytes)
+	}
+
 	// send ok to tell client they are connected
 	banner := s.banner
 	if len(banner) == 0 {
 		banner = "ok"
 	}
 	log.Debugf("sending '%s'", banner)
-	bSend, err := crypt.Encrypt([]byte(banner+"|||"+c.Connection().RemoteAddr().String()), strongKeyForEncryption)
+	response := banner + "|||" + c.Connection().RemoteAddr().String()
+	if result.room != "" && s.fastAdmission != nil && s.banner != "" {
+		if capability, issueErr := s.fastAdmission.issue(canonicalSource(c.Connection().RemoteAddr()), result.room); issueErr == nil {
+			response += "|||" + capability
+		}
+	}
+	bSend, err := crypt.Encrypt([]byte(response), strongKeyForEncryption)
 	if err != nil {
 		return
 	}
@@ -473,15 +519,17 @@ func (s *server) clientHandshake(c *comm.Comm, deadline time.Time) (result hands
 
 	// wait for client to tell me which room they want
 	log.Debug("waiting for answer")
-	enc, err := c.ReceiveWithDeadline(deadline)
-	if err != nil {
-		return
+	if result.room == "" {
+		enc, receiveErr := c.ReceiveWithDeadline(deadline)
+		if receiveErr != nil {
+			return handshakeResult{}, receiveErr
+		}
+		roomBytes, decryptErr := crypt.Decrypt(enc, strongKeyForEncryption)
+		if decryptErr != nil {
+			return handshakeResult{}, decryptErr
+		}
+		result.room = string(roomBytes)
 	}
-	roomBytes, err := crypt.Decrypt(enc, strongKeyForEncryption)
-	if err != nil {
-		return
-	}
-	result.room = string(roomBytes)
 	result.strongKeyForEncryption = strongKeyForEncryption
 	return
 }
@@ -489,15 +537,21 @@ func (s *server) clientHandshake(c *comm.Comm, deadline time.Time) (result hands
 func (s *server) clientCommunication(c *comm.Comm, handshake handshakeResult) (room string, err error) {
 	room = handshake.room
 	strongKeyForEncryption := handshake.strongKeyForEncryption
-	var bSend []byte
+	sendAdmission := func(payload string) error {
+		if handshake.fast {
+			return c.Send([]byte(payload))
+		}
+		encrypted, encryptErr := crypt.Encrypt([]byte(payload), strongKeyForEncryption)
+		if encryptErr != nil {
+			return encryptErr
+		}
+		return c.Send(encrypted)
+	}
 	if s.admissionLimits == nil {
 		s.admissionLimits = newAdmissionLimiter(s.sourceJoinLimit, s.roomJoinLimit, s.joinLimitWindow)
 	}
 	if !s.admissionLimits.allow(canonicalSource(c.Connection().RemoteAddr()), room) {
-		bSend, err = crypt.Encrypt([]byte("rate limited"), strongKeyForEncryption)
-		if err == nil {
-			err = c.Send(bSend)
-		}
+		err = sendAdmission("rate limited")
 		if err != nil {
 			return room, err
 		}
@@ -516,11 +570,7 @@ func (s *server) clientCommunication(c *comm.Comm, handshake handshakeResult) (r
 	if admission.created {
 		// tell the client that they got the room
 
-		bSend, err = crypt.Encrypt([]byte("ok"), strongKeyForEncryption)
-		if err != nil {
-			return
-		}
-		err = c.Send(bSend)
+		err = sendAdmission("ok")
 		if err != nil {
 			log.Error(err)
 			s.deleteRoom(room)
@@ -530,11 +580,7 @@ func (s *server) clientCommunication(c *comm.Comm, handshake handshakeResult) (r
 		return
 	}
 	if admission.full {
-		bSend, err = crypt.Encrypt([]byte("room full"), strongKeyForEncryption)
-		if err != nil {
-			return
-		}
-		err = c.Send(bSend)
+		err = sendAdmission("room full")
 		if err != nil {
 			log.Error(err)
 			return
@@ -544,24 +590,11 @@ func (s *server) clientCommunication(c *comm.Comm, handshake handshakeResult) (r
 	log.Debug("room has second peer")
 	otherConnection := admission.otherConnection
 
-	// second connection is the sender, time to staple connections
-	var wg sync.WaitGroup
-	wg.Add(1)
-
-	// start piping
-	go func(com1, com2 *comm.Comm, wg *sync.WaitGroup) {
-		log.Debug("starting pipes")
-		pipe(com1.Connection(), com2.Connection())
-		wg.Done()
-		log.Debug("done piping")
-	}(otherConnection, c, &wg)
-
-	// tell the sender everything is ready
-	bSend, err = crypt.Encrypt([]byte("ok"), strongKeyForEncryption)
-	if err != nil {
-		return
-	}
-	err = c.Send(bSend)
+	// Confirm admission before exposing the second peer to frames that the
+	// waiting peer may already have buffered. Starting the pipe first can race
+	// an application frame ahead of this encrypted confirmation, causing the
+	// second client to interpret that frame as a relay response.
+	err = sendAdmission("ok")
 	if err != nil {
 		s.deleteRoom(room)
 		return
@@ -569,6 +602,18 @@ func (s *server) clientCommunication(c *comm.Comm, handshake handshakeResult) (r
 	if s.roomPaired != nil {
 		s.roomPaired()
 	}
+
+	// Both peers have completed relay admission; staple their connections.
+	var wg sync.WaitGroup
+	wg.Add(1)
+
+	// start piping
+	go func(com1, com2 *comm.Comm, wg *sync.WaitGroup) {
+		log.Debug("starting pipes")
+		pipeWithProtocol(com1.Connection(), com2.Connection(), s.roomProtocol)
+		wg.Done()
+		log.Debug("done piping")
+	}(otherConnection, c, &wg)
 	wg.Wait()
 
 	// delete room
@@ -596,9 +641,113 @@ func (s *server) deleteRoom(room string) {
 // pipe creates a full-duplex pipe between the two sockets and
 // transfers data from one to the other.
 func pipe(conn1 net.Conn, conn2 net.Conn) {
+	pipeWithProtocol(conn1, conn2, nil)
+}
+
+const relayProtocolMessageLimit = 64 * 1024
+
+type firstFrameObserver struct {
+	buffer   []byte
+	expected int
+	done     bool
+	onFrame  func([]byte)
+}
+
+func (o *firstFrameObserver) Write(p []byte) (int, error) {
+	written := len(p)
+	if o.done || len(p) == 0 {
+		return written, nil
+	}
+
+	for len(p) > 0 && !o.done {
+		if o.expected == 0 {
+			needed := min(8-len(o.buffer), len(p))
+			o.buffer = append(o.buffer, p[:needed]...)
+			p = p[needed:]
+			if len(o.buffer) < 8 {
+				continue
+			}
+			if !bytes.Equal(o.buffer[:4], comm.MAGIC_BYTES) {
+				o.done = true
+				break
+			}
+			bodySize := binary.LittleEndian.Uint32(o.buffer[4:8])
+			if bodySize > relayProtocolMessageLimit {
+				o.done = true
+				break
+			}
+			o.expected = 8 + int(bodySize)
+		}
+
+		needed := min(o.expected-len(o.buffer), len(p))
+		o.buffer = append(o.buffer, p[:needed]...)
+		p = p[needed:]
+		if len(o.buffer) == o.expected {
+			o.done = true
+			if o.onFrame != nil {
+				o.onFrame(o.buffer[8:])
+			}
+		}
+	}
+	return written, nil
+}
+
+func observedRoomProtocol(payload []byte) (RoomProtocol, bool) {
+	m, err := message.DecodeWithLimit(nil, payload, relayProtocolMessageLimit)
+	if err != nil || m.Type != message.TypePAKE ||
+		!slices.Contains(m.Features, message.FeatureSSHRendezvous) {
+		return "", false
+	}
+	return RoomProtocolSSH, true
+}
+
+func copyWithProtocolObservation(dst, src net.Conn, onFrame func([]byte)) error {
+	observer := &firstFrameObserver{onFrame: onFrame}
+	buffer := make([]byte, 32*1024)
+	for !observer.done {
+		n, readErr := src.Read(buffer)
+		if n > 0 {
+			_, _ = observer.Write(buffer[:n])
+			remaining := buffer[:n]
+			for len(remaining) > 0 {
+				written, writeErr := dst.Write(remaining)
+				if writeErr != nil {
+					return writeErr
+				}
+				if written == 0 {
+					return io.ErrShortWrite
+				}
+				remaining = remaining[written:]
+			}
+		}
+		if readErr != nil {
+			if errors.Is(readErr, io.EOF) {
+				return nil
+			}
+			return readErr
+		}
+	}
+	// Resume the normal net.Conn copy path after the first frame so long-lived
+	// transfers can still use the platform's optimized socket forwarding.
+	_, err := io.Copy(dst, src)
+	return err
+}
+
+func pipeWithProtocol(conn1 net.Conn, conn2 net.Conn, callback func(RoomProtocol)) {
 	copyDone := make(chan error, 2)
+	var reportOnce sync.Once
 	copyDirection := func(dst, src net.Conn) {
-		_, err := io.Copy(dst, src)
+		var err error
+		if callback == nil {
+			_, err = io.Copy(dst, src)
+		} else {
+			err = copyWithProtocolObservation(dst, src, func(payload []byte) {
+				protocol, ok := observedRoomProtocol(payload)
+				if ok {
+					reportOnce.Do(func() { callback(protocol) })
+				}
+			})
+		}
 		copyDone <- err
 	}
 	go copyDirection(conn2, conn1)
@@ -624,35 +773,10 @@ func MeasureServerLatency(address string, timeout time.Duration) (duration time.
 func MeasureServerLatencyContext(ctx context.Context, address string, timeout time.Duration) (duration time.Duration, err error) {
 	log.Debugf("pinging %s", address)
 	started := time.Now()
-	type connectionResult struct {
-		connection *comm.Comm
-		err        error
-	}
-	connected := make(chan connectionResult, 1)
-	go func() {
-		c, connectErr := comm.NewConnection(address, timeout)
-		connected <- connectionResult{connection: c, err: connectErr}
-	}()
-
-	var c *comm.Comm
-	select {
-	case <-ctx.Done():
-		// The dial may finish at the same instant as cancellation. Drain its
-		// result asynchronously so a successfully opened connection is still
-		// closed even when cancellation wins this select.
-		go func() {
-			result := <-connected
-			if result.connection != nil {
-				result.connection.Close()
-			}
-		}()
-		return 0, ctx.Err()
-	case result := <-connected:
-		if result.err != nil {
-			log.Debug(result.err)
-			return 0, result.err
-		}
-		c = result.connection
+	c, err := comm.NewConnectionContext(ctx, address, timeout)
+	if err != nil {
+		log.Debug(err)
+		return 0, err
 	}
 	defer c.Close()
 	stopCancel := context.AfterFunc(ctx, func() { c.Close() })
@@ -689,16 +813,103 @@ func MeasureServerLatencyContext(ctx context.Context, address string, timeout ti
 // ConnectToTCPServer will initiate a new connection
 // to the specified address, room with optional time limit
 func ConnectToTCPServer(address, password, room string, timelimit ...time.Duration) (c *comm.Comm, banner string, ipaddr string, err error) {
+	c, banner, ipaddr, _, err = ConnectToTCPServerControl(address, password, room, timelimit...)
+	return
+}
+
+// ConnectToTCPServerControl joins a control room and returns an optional fast
+// data-admission capability advertised by an upgraded relay.
+func ConnectToTCPServerControl(address, password, room string, timelimit ...time.Duration) (c *comm.Comm, banner string, ipaddr string, capability string, err error) {
+	return ConnectToTCPServerControlContext(context.Background(), address, password, room, timelimit...)
+}
+
+// ConnectToTCPServerControlContext joins a control room and closes the
+// connection if the caller cancels during dialing or relay authentication.
+func ConnectToTCPServerControlContext(ctx context.Context, address, password, room string, timelimit ...time.Duration) (c *comm.Comm, banner string, ipaddr string, capability string, err error) {
 	defer func() { err = redact.Error(err, password, room) }()
-	if len(timelimit) > 0 {
-		c, err = comm.NewConnection(address, timelimit[0])
-	} else {
-		c, err = comm.NewConnection(address)
-	}
+	c, err = comm.NewConnectionContext(ctx, address, timelimit...)
 	if err != nil {
 		log.Debug(err)
 		return
 	}
+	stopClose := context.AfterFunc(ctx, c.Close)
+	defer stopClose()
+	banner, ipaddr, capability, err = HandshakeTCPServerCapability(c, password, room)
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		err = ctxErr
+	}
+	if err != nil {
+		c.Close()
+		c = nil
+		log.Debug(err)
+	}
+	return
+}
+
+// ConnectToTCPServerWithCapability uses the optional upgraded-relay fast path
+// and transparently reconnects with the legacy PAKE handshake on rejection.
+func ConnectToTCPServerWithCapability(address, password, room, capability string, timelimit ...time.Duration) (c *comm.Comm, banner string, ipaddr string, fast bool, err error) {
+	return ConnectToTCPServerWithCapabilityContext(context.Background(), address, password, room, capability, timelimit...)
+}
+
+// ConnectToTCPServerWithCapabilityContext is
+// ConnectToTCPServerWithCapability with cancellation support.
+func ConnectToTCPServerWithCapabilityContext(ctx context.Context, address, password, room, capability string, timelimit ...time.Duration) (c *comm.Comm, banner string, ipaddr string, fast bool, err error) {
+	defer func() { err = redact.Error(err, password, room, capability) }()
+	if capability != "" {
+		timeout := 30 * time.Second
+		if len(timelimit) > 0 {
+			timeout = timelimit[0]
+		}
+		c, err = comm.NewConnectionContext(ctx, address, timeout)
+		if err == nil {
+			stopClose := context.AfterFunc(ctx, c.Close)
+			defer stopClose()
+			var request []byte
+			request, err = encodeFastAdmissionRequest(capability, room)
+			if err == nil {
+				err = c.Send(request)
+			}
+			if err == nil {
+				var confirmation []byte
+				confirmation, err = c.Receive()
+				if err == nil && bytes.Equal(confirmation, []byte("ok")) {
+					if !stopClose() || ctx.Err() != nil {
+						c.Close()
+						return nil, "", "", false, ctx.Err()
+					}
+					return c, "", "", true, nil
+				}
+				if err == nil && bytes.Equal(confirmation, []byte("rate limited")) {
+					c.Close()
+					return nil, "", "", false, ErrAdmissionLimited
+				}
+				if err == nil && bytes.Equal(confirmation, []byte("room full")) {
+					c.Close()
+					return nil, "", "", false, errors.New("relay room full")
+				}
+			}
+			stopClose()
+			c.Close()
+		}
+		log.Debug("fast relay admission unavailable; retrying legacy handshake")
+	}
+	c, banner, ipaddr, _, err = ConnectToTCPServerControlContext(ctx, address, password, room, timelimit...)
+	return c, banner, ipaddr, false, err
+}
+
+// HandshakeTCPServer authenticates and joins a room over an already-open TCP
+// connection. Keeping raw dialing separate lets callers race address families
+// without admitting the same client to a relay room more than once.
+func HandshakeTCPServer(c *comm.Comm, password, room string) (banner string, ipaddr string, err error) {
+	banner, ipaddr, _, err = HandshakeTCPServerCapability(c, password, room)
+	return
+}
+
+// HandshakeTCPServerCapability is HandshakeTCPServer plus the optional opaque
+// data-port capability advertised by an upgraded relay.
+func HandshakeTCPServerCapability(c *comm.Comm, password, room string) (banner string, ipaddr string, capability string, err error) {
+	defer func() { err = redact.Error(err, password, room) }()
 
 	// get PAKE connection with server to establish strong key to transfer info
 	A, err := pake.InitCurve(weakKey, 0, "siec")
@@ -749,6 +960,24 @@ func ConnectToTCPServer(address, password, room string, timelimit ...time.Durati
 		log.Debug(err)
 		return
 	}
+
+	// The room identifier uses the same relay-session key as the password, so
+	// there is no need to wait for the authentication banner before sending it.
+	// Existing relays read the frames in their original order and simply find
+	// this one already buffered after password verification. This pipelines the
+	// last admission flight without changing the wire format.
+	log.Debug("sending encrypted room identifier")
+	bRoom, err := crypt.Encrypt([]byte(room), strongKeyForEncryption)
+	if err != nil {
+		log.Debug(err)
+		return
+	}
+	err = c.Send(bRoom)
+	if err != nil {
+		log.Debug(err)
+		return
+	}
+
 	log.Debug("waiting for first ok")
 	enc, err := c.Receive()
 	if err != nil {
@@ -769,18 +998,11 @@ func ConnectToTCPServer(address, password, room string, timelimit ...time.Durati
 		log.Debug(err)
 		return
 	}
-	banner = strings.Split(string(data), "|||")[0]
-	ipaddr = strings.Split(string(data), "|||")[1]
-	log.Debug("sending encrypted room identifier")
-	bSend, err = crypt.Encrypt([]byte(room), strongKeyForEncryption)
-	if err != nil {
-		log.Debug(err)
-		return
-	}
-	err = c.Send(bSend)
-	if err != nil {
-		log.Debug(err)
-		return
+	parts := strings.Split(string(data), "|||")
+	banner = parts[0]
+	ipaddr = parts[1]
+	if len(parts) > 2 {
+		capability = parts[2]
 	}
 	log.Debug("waiting for room confirmation")
 	enc, err = c.Receive()

@@ -11,7 +11,7 @@ import (
 	"strings"
 	"sync"
 
-	log "github.com/schollz/logger"
+	log "github.com/schollz/croc/v11/src/logger"
 )
 
 const (
@@ -164,7 +164,7 @@ func (c *Client) hashSourceFile(name, algorithm string, showProgress bool) ([]by
 			return cached, true, nil
 		}
 	}
-	actual, err := c.stop.hash(name, algorithm, showProgress)
+	actual, err := c.hashFile(name, algorithm, showProgress)
 	if err != nil {
 		return nil, false, err
 	}
@@ -184,7 +184,7 @@ func (c *Client) hashReceiverFile(name, algorithm string, expected []byte, showP
 			return cached, true, nil
 		}
 	}
-	actual, err := c.stop.hash(name, algorithm, showProgress)
+	actual, err := c.hashFile(name, algorithm, showProgress)
 	return actual, false, err
 }
 

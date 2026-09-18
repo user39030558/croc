@@ -16,12 +16,12 @@ import (
 	"time"
 
 	"github.com/denisbrodbeck/machineid"
-	log "github.com/schollz/logger"
 	"github.com/schollz/progressbar/v3"
 
 	"github.com/schollz/croc/v11/src/comm"
 	"github.com/schollz/croc/v11/src/compress"
 	"github.com/schollz/croc/v11/src/crypt"
+	log "github.com/schollz/croc/v11/src/logger"
 	"github.com/schollz/croc/v11/src/message"
 	"github.com/schollz/croc/v11/src/models"
 	"github.com/schollz/croc/v11/src/termui"

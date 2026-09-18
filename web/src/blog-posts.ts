@@ -8,34 +8,50 @@ export type BlogVisual =
   | "browser"
   | "bridge"
   | "stored"
+  | "derp"
+  | "ssh"
+  | "ssh-release"
+  | "update-release"
   | "release";
 
 export type BlogKind = "note" | "update";
 
+export type BlogTextLink = {
+  label: string;
+  href: string;
+};
+
 export type BlogBlock =
   | { type: "heading"; text: string }
-  | { type: "paragraph"; text: string }
+  | { type: "paragraph"; text: string; links?: BlogTextLink[] }
   | { type: "list"; items: string[] }
   | { type: "code"; label: string; lines: string[] }
-  | { type: "aside"; eyebrow: string; title: string; text: string }
+  | { type: "details"; summary: string; lines: string[] }
   | {
-      type: "table";
-      caption: string;
-      headers: string[];
-      indicatorColumns?: number[];
-      indicatorLegend?: {
-        full: string;
-        partial: string;
-        empty: string;
-        terms?: Array<{ term: string; definition: string }>;
-      };
-      rowOrder?: string[];
-      rows: Array<{
-        cells: string[];
-        href: string;
-        highlight?: boolean;
-      }>;
+    type: "aside";
+    eyebrow: string;
+    title: string;
+    text: string;
+    links?: BlogTextLink[];
+  }
+  | {
+    type: "table";
+    caption: string;
+    headers: string[];
+    indicatorColumns?: number[];
+    indicatorLegend?: {
+      full: string;
+      partial: string;
+      empty: string;
+      terms?: Array<{ term: string; definition: string }>;
     };
+    rowOrder?: string[];
+    rows: Array<{
+      cells: string[];
+      href: string;
+      highlight?: boolean;
+    }>;
+  };
 
 export type BlogPost = {
   slug: string;
@@ -72,7 +88,9 @@ const fileTransferToolOrder = [
   "croc",
   "MEGA",
   "Filemail",
+  "Floe",
   "Syncthing",
+  "AirPipe",
   "WebWormhole",
   "SwissTransfer",
   "transfer.sh",
@@ -84,6 +102,8 @@ const fileTransferToolOrder = [
   "Send Anywhere",
   "LocalSend",
   "KDE Connect",
+  "derphole",
+  "wormhole-william",
   "Magic Wormhole",
   "qrcp",
   "OnionShare",
@@ -111,6 +131,7 @@ export function blogWordCount(blocks: BlogBlock[]) {
   return blocks.flatMap((block) => {
     if (block.type === "list") return block.items;
     if (block.type === "code") return block.lines;
+    if (block.type === "details") return [block.summary, ...block.lines];
     if (block.type === "aside") {
       return [block.eyebrow, block.title, block.text];
     }
@@ -120,14 +141,14 @@ export function blogWordCount(blocks: BlogBlock[]) {
         ...block.headers,
         ...(block.indicatorLegend
           ? [
-              block.indicatorLegend.full,
-              block.indicatorLegend.partial,
-              block.indicatorLegend.empty,
-              ...(block.indicatorLegend.terms?.flatMap(({ term, definition }) => [
-                term,
-                definition,
-              ]) ?? []),
-            ]
+            block.indicatorLegend.full,
+            block.indicatorLegend.partial,
+            block.indicatorLegend.empty,
+            ...(block.indicatorLegend.terms?.flatMap(({ term, definition }) => [
+              term,
+              definition,
+            ]) ?? []),
+          ]
           : []),
         ...block.rows.flatMap((row) => row.cells),
       ];
@@ -141,6 +162,603 @@ export function readingMinutes(blocks: BlogBlock[]) {
 }
 
 const drafts: DraftBlogPost[] = [
+  {
+    slug: "croc-v11-5-release-update",
+    number: "04",
+    title: "croc v11.5 can update itself",
+    description:
+      "croc v11.5 adds safe self-updates and makes shared SSH sessions clearer when they start, reconnect, or end.",
+    kind: "update",
+    category: "Release notes",
+    publishedAt: "2026-09-05",
+    publishedLabel: "September 5, 2026",
+    author: "schollz",
+    visual: "update-release",
+    takeaway:
+      "v11.5 adds croc update for verified standalone upgrades, while making SSH hosting, compatibility errors, relay limits, and clean shutdowns easier to understand.",
+    blocks: [
+      {
+        type: "paragraph",
+        text: "The usual way to update croc has been to install croc again. This works, but it is a funny errand to repeat for a program whose main appeal is doing useful things with one small command. v11.5 adds another one: croc update.",
+      },
+      {
+        type: "paragraph",
+        text: "This is a self-updater, but not an unattended updater. croc will still make its quiet daily version check after a transfer and mention a newer release when one exists. It will not replace itself in the background. You ask it to update, it explains what it found, and it asks before changing the executable.",
+      },
+      { type: "heading", text: "Updating croc from croc" },
+      {
+        type: "code",
+        label: "Check first, then update",
+        lines: [
+          "$ croc update --check",
+          "croc v11.6.0 is available (current: v11.5.0).",
+          "",
+          "$ croc update",
+          "Update croc from v11.5.0 to v11.6.0? (y/N) y",
+          "Updated croc from v11.5.0 to v11.6.0.",
+          "",
+          "# This spelling works too",
+          "$ croc upgrade",
+        ],
+      },
+      {
+        type: "paragraph",
+        text: "The --check form only reports what is available. A normal croc update asks for confirmation, and croc update --yes is there for scripts. The old update notice at the end of a transfer now points to croc update instead of handing you another installer command.",
+      },
+      {
+        type: "paragraph",
+        text: "There is an important limit: croc only replaces an official standalone installation that the installer has marked for this purpose. The mark records the exact, resolved path to the executable. Before updating, croc checks that the path still matches, that it is a regular file rather than a symlink, and that both the file and its directory are writable without asking for more privileges.",
+      },
+      {
+        type: "paragraph",
+        text: "Homebrew, Nix, Scoop, Chocolatey, Conda, MacPorts, Termux, FreeBSD packages, system packages, and go install should remain in charge of their own files. croc recognizes those common locations and prints the appropriate command instead of barging in. On Windows it points to the release download because a running executable cannot be replaced with the same safe operation. That boundary is deliberate: I wanted croc to update itself without appointing it the package manager for the whole computer.",
+      },
+      {
+        type: "paragraph",
+        text: "For an eligible standalone install, croc downloads the release archive and its checksum over HTTPS, verifies the SHA-256 checksum, stages the new binary beside the old one, and runs the staged binary to make sure it reports the requested version. Only then does it replace the current executable with one rename. If any check fails, the croc you started with stays where it was. I made this intentionally conservative. An updater is a useful place to be boring.",
+      },
+      { type: "heading", text: "SSH should look like it is running" },
+      {
+        type: "paragraph",
+        text: "v11.4 introduced croc ssh, and its attached host shell was almost too seamless. After printing the invitation, croc dropped into the shared shell, which could look exactly like it had returned to the ordinary prompt. v11.5 prints a clear entry message, temporarily changes the terminal title to croc ssh — hosting, and restores the old title afterward. It also says plainly what Ctrl-C and Ctrl-] will do.",
+      },
+      {
+        type: "paragraph",
+        text: "The end of a session is clearer as well. Detaching says that the shared shell is still running. Stopping says that it ended. When the host intentionally closes the session, croc now closes the shared PTY first and gives connected guests a short chance to receive the normal SSH exit status. A guest can therefore say that the host ended the terminal instead of repeatedly announcing that the connection was lost. Real transport failures still reconnect as before.",
+      },
+      { type: "heading", text: "Old clients get an answer" },
+      {
+        type: "paragraph",
+        text: "There was an especially confusing mixed-version case. A client from before croc ssh existed could read an SSH invitation as an ordinary receive code and wait forever at “securing channel...”. A v11.5 host now recognizes that older handshake, finishes the authenticated exchange it expects, and returns an encrypted message explaining that SSH sharing needs croc v11.4.0 or newer. Other SSH protocol mismatches also come back as readable encrypted errors in both the terminal and browser.",
+      },
+      {
+        type: "paragraph",
+        text: "Relay failures have received the same treatment. croc now tries the ordinary relay fallback only after Tailcat authorization worked but attaching the SSH connection did not. If the relay is limiting new admissions, the client says so, waits at least five seconds, and keeps the lower-level cause in debug output. Retrying should help with a temporary failure, not turn one failure into several faster failures.",
+      },
+      { type: "heading", text: "Getting v11.5" },
+      {
+        type: "paragraph",
+        text: "A v11.4 client does not know croc update yet, so this is the last standalone update that needs the familiar installer. Install v11.5 once with the official command and that installer will register the executable for later self-updates. Package-managed installations should update through their package manager as usual.",
+      },
+      {
+        type: "code",
+        label: "Install v11.5",
+        lines: [
+          "$ curl https://getcroc.com | bash",
+          "$ croc --version",
+          "croc version 11.5.0",
+          "$ croc update --check",
+          "croc v11.5.0 is up to date.",
+        ],
+      },
+      {
+        type: "paragraph",
+        text: "v11.5 is mostly about removing small moments of doubt: whether croc is still hosting, whether a guest should reconnect, whether the relay wants a pause, and how to get the next release. The commands are still small. They just explain themselves a little better now.",
+      },
+    ],
+  },
+  {
+    slug: "croc-v11-4-release-update",
+    number: "03",
+    title: "croc v11.4 shares the terminal",
+    description:
+      "croc v11.4 adds secure collaborative terminals, separate read/write and read-only invitations, automatic reconnection, and browser joining.",
+    kind: "update",
+    category: "Release notes",
+    publishedAt: "2026-09-03",
+    publishedLabel: "September 3, 2026",
+    author: "schollz",
+    visual: "ssh-release",
+    takeaway:
+      "v11.4 adds croc ssh: host one persistent terminal from the CLI, invite read/write or read-only participants, and let them join from croc or getcroc.com.",
+    blocks: [
+      {
+        type: "paragraph",
+        text: "croc has spent most of its life moving files. In v11.4 it can share something that is a little harder to put in a folder: the terminal where you are already working. Run one command, send somebody a six-word invitation, and both of you are looking at the same shell.",
+      },
+      {
+        type: "paragraph",
+        text: "The new command is croc ssh. It does not turn on the computer's normal SSH server or ask you to arrange accounts and keys. It starts one temporary collaborative session beside the existing file-transfer commands. croc send still behaves as before; v11.4 just gives croc one more useful thing to introduce between two computers.",
+      },
+      { type: "heading", text: "The short version" },
+      {
+        type: "list",
+        items: [
+          "croc ssh hosts one persistent shell on Linux, macOS, FreeBSD, or OpenBSD; those systems and Windows can join from the CLI.",
+          "The host prints independent six-word invitations for read/write and read-only access.",
+          "Guests can detach without ending the shell and automatically reauthenticate after a temporary network loss.",
+          "getcroc.com now has an SSH mode that can join either invitation directly from an evergreen desktop browser.",
+          "Native guests try a direct Tailcat WireGuard route, use DERP when direct networking is blocked, and can fall back to the ordinary croc relay; browsers use the relay path.",
+        ],
+      },
+      {
+        type: "paragraph",
+        text: "This update is the release overview. I wrote a separate field note, Share a terminal with croc ssh, with the tmate background, alternatives, protocol details, trust model, and the sharper edges of sharing a real shell.",
+        links: [
+          {
+            label: "Share a terminal with croc ssh",
+            href: "https://getcroc.com/blog/share-terminal-with-croc-ssh",
+          },
+        ],
+      },
+      { type: "heading", text: "One command opens two doors" },
+      {
+        type: "code",
+        label: "Host a shared terminal",
+        lines: [
+          "$ croc ssh",
+          "Shared SSH terminal is ready",
+          "  Read/write: CROC_SECRET='...' croc ssh",
+          "  Read-only:  CROC_SECRET='...' croc ssh",
+          "  Expires:    12h0m0s",
+          "  Stop:       Ctrl-C",
+          "  Detach:     Ctrl-] (the shared shell keeps running)",
+        ],
+      },
+      {
+        type: "paragraph",
+        text: "Both invitations enter the same PTY and receive its existing output. A read/write participant can type alongside the attached host. A read-only participant sees the same screen, but the host discards that participant's input before it reaches the shell. The codes are generated independently, so sharing the viewing code does not reveal the typing code.",
+      },
+      {
+        type: "paragraph",
+        text: "The host is attached by default, which makes pair debugging feel like pulling another chair up to the terminal. --headless leaves the session running without occupying the host's terminal, --dir chooses the starting directory, and --duration replaces the twelve-hour default lifetime. Any number of people may attach, within the relay and host's practical limits.",
+      },
+      { type: "heading", text: "The browser can join, too" },
+      {
+        type: "paragraph",
+        text: "The getcroc.com homepage now has a Files / SSH switch. Choose SSH, paste either invitation, and the page becomes a terminal with its authenticated role shown above it. Read/write guests can type normally. Read-only input is disabled in the page and independently rejected by the host. Ctrl-C still reaches the shared program; Disconnect or Ctrl-] leaves the session.",
+      },
+      {
+        type: "paragraph",
+        text: "This is intentionally a croc SSH joiner rather than a general browser SSH client. It cannot host a terminal or connect to an arbitrary server. It uses the ordinary croc relay path and runs PAKE, host-key verification, and the SSH client in WebAssembly. The terminal interface and separate SSH module load only after SSH mode is selected, and the invitation stays in memory instead of being copied into a URL, browser storage, QR code, log, or analytics event.",
+      },
+
+      { type: "heading", text: "It is still croc underneath" },
+      {
+        type: "paragraph",
+        text: "Each role gets a six-word invitation. The first two words derive an opaque rendezvous room and the remaining four are the PAKE secret. Host and guest prove that they know the same invitation and confirm the resulting key without placing the secret on the relay. The authenticated reply also carries the exact ephemeral SSH host key, so the client pins it without a trust-on-first-use prompt.",
+      },
+      {
+        type: "paragraph",
+        text: "A native guest then uses Tailcat to make a small accountless userspace WireGuard network. It starts through DERP and promotes the session to direct UDP when the networks cooperate. If Tailcat cannot establish the SSH connection, both sides authenticate again and carry the pinned SSH stream over the selected croc relay. There is no Tailscale account, daemon, public IP, port-forwarding rule, or normal SSH service to configure.",
+        links: [
+          { label: "Tailcat", href: "https://github.com/tailscale/tailcat" },
+        ],
+      },
+      {
+        type: "table",
+        caption: "What v11.4 adds",
+        headers: ["Part", "New behavior", "Boundary"],
+        rows: [
+          {
+            cells: ["Native CLI", "Host or join one shared terminal", "Hosting needs a PTY-capable Unix platform"],
+            href: "https://github.com/schollz/croc/blob/main/src/docs/SSH_SHARING.md",
+          },
+          {
+            cells: ["Browser", "Join read/write or read-only from getcroc.com", "Join-only and croc-relay-only"],
+            href: "https://getcroc.com/",
+          },
+          {
+            cells: ["Invitations", "Independent six-word codes for two roles", "Anyone holding a code has its role"],
+            href: "https://getcroc.com/blog/share-terminal-with-croc-ssh",
+          },
+          {
+            cells: ["Session", "Detach, reconnect, and replay recent output", "One shared shell, not separate logins"],
+            href: "https://github.com/schollz/croc/blob/main/src/docs/SSH_SHARING.md#reconnection",
+          },
+        ],
+      },
+      { type: "heading", text: "Try v11.4" },
+      {
+        type: "code",
+        label: "Install and start sharing",
+        lines: [
+          "$ curl https://getcroc.com | bash",
+          "$ croc --version",
+          "croc version 11.4.0",
+          "$ croc ssh",
+        ],
+      },
+      {
+        type: "paragraph",
+        text: "Then send the appropriate invitation to somebody with croc or a desktop browser. File transfer was the reason croc learned how to introduce two computers securely. v11.4 reuses that introduction for a terminal, and I like that the result still begins with one small command.",
+      },
+    ],
+  },
+  {
+    slug: "share-terminal-with-croc-ssh",
+    number: "11",
+    title: "Share a terminal with croc ssh",
+    description:
+      "croc ssh turns a six-word invitation into one shared terminal with read/write or read-only access from the CLI or browser.",
+    category: "Remote terminals",
+    publishedAt: "2026-09-03",
+    publishedLabel: "September 3, 2026",
+    author: "schollz",
+    visual: "ssh",
+    takeaway:
+      "Run croc ssh, share the appropriate six-word invitation, and another person can join the persistent shell from the CLI or browser without an account, inbound port, or Tailscale setup.",
+    blocks: [
+      {
+        type: "paragraph",
+        text: "Sometimes I am on a Zoom with someone sharing their terminal and it is impossible to see their terminal and it is becoming tedious sharing commands from their terminal to mine. The solution is to share the SSH session with each other, so my terminal is rendering exactly what theirs is. Ordinary SSH is excellent, but it is complicated by needing an account, a public key, a reachable port, or a VPN. I wanted the croc version: print a short code and let the other computer find its way in.",
+      },
+      {
+        type: "paragraph",
+        text: "croc v11.4 introduces croc ssh. It creates one persistent shell on the host and gives it two doors: 1) a read/write invitation for somebody who can type with you, and 2) a read-only invitation is for somebody who can just watch over your shoulder. Both arrive in the same terminal, including the output that appeared before they joined.",
+      },
+      {
+        type: "code",
+        label: "Start a shared terminal",
+        lines: [
+          "$ croc ssh",
+          "Shared SSH terminal is ready",
+          "  Read/write: CROC_SECRET='whoop-flap-alias-mouth-crowd-lived' croc ssh",
+          "  Read-only:  CROC_SECRET='help-cause-stage-pork-reset-crowd' croc ssh",
+          "  Expires:    12h0m0s",
+          "  Stop:       Ctrl-C",
+          "  Detach:     Ctrl-] (the shared shell keeps running)",
+        ],
+      },
+      {
+        type: "paragraph",
+        text: "Choose which door, and then send one line to the person joining. On Unix, CROC_SECRET keeps the six words out of the process list; running croc ssh and pasting the code at its prompt works too. Windows can use croc ssh followed by the code directly.",
+      },
+      { type: "heading", text: "The browser can play, too" },
+      {
+        type: "paragraph",
+        text: "The web client now has a Files / SSH switch, so even if you don't have a terminal handy you can Open SSH at getcroc.com, paste either six-word invitation, and the page becomes a full-width terminal showing its authenticated read/write or read-only role. Ctrl-C behaves normally; Disconnect or Ctrl-] leaves. This is a croc-specific joiner, not a general SSH client: it uses the ordinary croc relay path, while PAKE, pinned-host-key verification, and SSH stay in browser WASM, so croc-web forwards ciphertext rather than terminal text.",
+      },
+      {
+        type: "paragraph",
+        text: "The terminal code loads only when SSH is selected, and the invitation stays in memory rather than URLs or storage. A self-hosted web client must use the host's relay pool and password. Read-only input is disabled in the page and still rejected by the host.",
+      },
+      { type: "heading", text: "The tmate-shaped hole" },
+      {
+        type: "paragraph",
+        text: "tmate was the wonderfully simple answer to this problem for years: run one command and get an SSH address that another person can open. In July 2025, its maintainer said the public servers were closing permanently. The source is still available and the server can be self-hosted, but the useful zero-setup meeting place is gone. There are altneratives, but they are not as simple or as widely known. croc ssh is a new option that is designed to be easy to use and easy to self-host.",
+        links: [
+          {
+            label: "said the public servers were closing permanently",
+            href: "https://github.com/tmate-io/tmate/issues/322#issuecomment-3083622301",
+          },
+          {
+            label: "source is still available",
+            href: "https://github.com/tmate-io/tmate",
+          },
+        ],
+      },
+      {
+        type: "table",
+        caption: "Several ways to put another person in a terminal",
+        headers: ["Tool", "Guest uses", "Meeting point", "Useful distinction"],
+        rows: [
+          {
+            cells: ["croc ssh", "croc or browser", "croc relay; CLI can use direct/DERP", "Six-word read/write and read-only invitations"],
+            href: "https://github.com/schollz/croc/blob/5595b7507a27f513e3ea460fdd561ee639642d57/src/docs/SSH_SHARING.md",
+            highlight: true,
+          },
+          {
+            cells: ["tmate", "SSH or tmate", "Self-hosted tmate server", "The public tmate.io service has closed"],
+            href: "https://github.com/tmate-io/tmate",
+          },
+          {
+            cells: ["Upterm", "SSH", "uptermd", "Public-key authorization and self-hosting"],
+            href: "https://github.com/owenthereal/upterm",
+          },
+          {
+            cells: ["sshx", "Web browser", "Hosted sshx service", "Browser-native multi-user terminal and cursors"],
+            href: "https://github.com/ekzhang/sshx",
+          },
+          {
+            cells: ["SSH + tmux", "SSH and tmux", "Your SSH service or VPN", "Uses the accounts and network you already manage"],
+            href: "https://github.com/tmux/tmux",
+          },
+        ],
+      },
+      { type: "heading", text: "How it works" },
+      {
+        type: "paragraph",
+        text: "Each invitation has six EFF words. The first two derive an opaque room name on the selected croc relay. The remaining four are the PAKE secret. Host and guest meet in that room, prove that they know the same secret, and confirm the resulting key without sending the secret itself. The read/write and read-only codes are generated independently, so knowing one does not reveal the other.",
+        links: [
+          {
+            label: "PAKE",
+            href: "https://getcroc.com/blog/pake-step-by-step",
+          },
+        ],
+      },
+      {
+        type: "paragraph",
+        text: "After that exchange, the guest sends a fresh Tailcat public key through the encrypted control channel. The host answers with the connection information, the guest's role, and an ephemeral SSH host key. Because that host key arrives inside the PAKE-authenticated message, the guest can pin it exactly. There is no trust-on-first-use question and no host key left behind to recognize next week.",
+        links: [
+          { label: "Tailcat", href: "https://github.com/tailscale/tailcat" },
+        ],
+      },
+      {
+        type: "paragraph",
+        text: "Tailcat builds a tiny accountless userspace WireGuard network. It starts through Tailscale's DERP infrastructure and tries to upgrade to direct UDP when the two networks allow it. No Tailscale account, control plane, daemon, root access, or open inbound port is required. If Tailcat cannot establish the SSH connection, both sides run PAKE again and turn the ordinary croc relay connection into the pinned SSH stream. The slower path is also the dependable path.",
+      },
+      {
+        type: "aside",
+        eyebrow: "SECURITY",
+        title: "The invitation and terminal remain end-to-end encrypted",
+        text: "A croc relay sees an opaque room plus connection timing. When it carries the fallback stream, it can also see the volume and timing of SSH ciphertext. A DERP relay can see similar transport metadata. Neither receives the invitation secret, terminal contents, Tailcat authorization, or SSH host key.",
+      },
+      { type: "heading", text: "Pulling up a chair" },
+      {
+        type: "paragraph",
+        text: "The croc ssh feature is intentionally closer to pulling another chair up to one terminal than provisioning a login. Everybody sees the same PTY. Read/write guests and the attached host may type into it; input from a read-only guest is discarded before it reaches the shell. Up to 8 MiB of recent output stays in memory and is replayed when somebody attaches, so a late arrival does not begin with a mysteriously blank screen.",
+      },
+      {
+        type: "paragraph",
+        text: "Ctrl-] detaches a participant without stopping the shell. A guest whose network disappears will reauthenticate and reconnect for up to two minutes by default. The host's Ctrl-C ends the session, while Ctrl-C from a guest remains ordinary terminal input and can interrupt the program in front of everyone. It is one real shell, including the sharp edges.",
+      },
+      {
+        type: "code",
+        label: "A few useful host and guest options",
+        lines: [
+          "# Keep the shared shell without attaching the host terminal",
+          "$ croc ssh --headless",
+          "",
+          "# Start in a project and expire after thirty minutes",
+          "$ croc ssh --dir /path/to/project --duration 30m",
+        ],
+      },
+      { type: "heading", text: "Limitations" },
+      {
+        type: "paragraph",
+        text: "The embedded SSH server accepts an interactive terminal, not remote commands, SFTP, agent forwarding, port forwarding, or arbitrary channels. That smaller surface is deliberate. It is a shared session, not a replacement for administering a machine over SSH.",
+      },
+      {
+        type: "paragraph",
+        text: "The invitation is a bearer capability. There is no identity screen or button for removing one participant; stop the host to revoke both codes. Read-only means a person cannot type, not that the screen is harmless: they can still see and record credentials or other secrets printed in the terminal. A read/write guest operates with the privileges of the user who started croc ssh. There is no extra sandbox between them and that account.",
+      },
+      {
+        type: "paragraph",
+        text: "croc ssh arrives in v11.4. Hosting works on Linux, macOS, FreeBSD, and OpenBSD. Those systems, Windows, and evergreen desktop browsers can join. The complete protocol and trust model are in the SSH sharing documentation. I am curious whether this feels useful for pair debugging, support, demos, and the occasional broken server at an inconvenient hour. Try it with a terminal you can afford to share, and let me know what you think!",
+        links: [
+          {
+            label: "SSH sharing documentation",
+            href: "https://github.com/schollz/croc/blob/5595b7507a27f513e3ea460fdd561ee639642d57/src/docs/SSH_SHARING.md",
+          },
+        ],
+      },
+    ],
+  },
+  {
+    slug: "croc-v11-3-release-update",
+    number: "02",
+    title: "croc v11.3 goes peer-to-peer",
+    description:
+      "croc v11.3 adds PAKE-bound Tailcat WireGuard streams, promotes them directly with magicsock, uses DERP as fallback, and retains croc relays.",
+    kind: "update",
+    category: "Release notes",
+    publishedAt: "2026-08-24",
+    publishedLabel: "August 24, 2026",
+    author: "schollz",
+    visual: "derp",
+    takeaway:
+      "CLI-to-CLI transfers now try a direct WireGuard path first, can stay encrypted over public DERP when direct networking is blocked, and return to croc's relay path if DERP setup fails.",
+    blocks: [
+      {
+        type: "paragraph",
+        text: "I have been working on croc again. The command is still the same: send a file, share the three-word code, and let the other computer receive it. In v11.3, however, the path taken by the file can be completely different.",
+      },
+      {
+        type: "paragraph",
+        text: "When two compatible native clients connect, croc now tries to move the file through a direct WireGuard connection between them. If a direct route is blocked, the transfer can stay on the public Tailscale DERP network. If that transport cannot be established, both clients coordinate a final fallback to croc's existing relay data ports. croc is now peer-to-peer when it can be, and still works when it cannot be.",
+      },
+      { type: "heading", text: "The short version" },
+      {
+        type: "list",
+        items: [
+          "v11.2 spread public transfers across three croc relays, selected the first healthy relay to answer, and encoded that choice into the normal three-word code.",
+          "The later v11.2 releases improved terminal and browser feedback, added quiet background update notices, and hardened received paths, ZIP extraction, stored transfers, and relay admission.",
+          "v11.3 adds a CLI-to-CLI data transport built on Tailcat: direct WireGuard when possible, public DERP when direct networking is blocked, and the previous croc relay path when DERP setup fails.",
+          "The default remains automatic. Browsers, older clients, stored transfers, and local-only transfers continue onto the compatible path without requiring a new workflow.",
+        ],
+      },
+      { type: "heading", text: "v11.2 learned to choose a relay" },
+      {
+        type: "paragraph",
+        text: "v11.2 replaced one public relay address with a pool of three deployments. On the first send from a machine, croc races a small ping against the pool and remembers the first healthy relay to answer. It then generates an ordinary EFF code whose hash maps to that relay. The receiver can repeat the same calculation from the code alone, so both sides arrive at the same place without adding server details to the phrase. The browser client uses the same scheme.",
+      },
+      {
+        type: "paragraph",
+        text: "That change distributed traffic and usually moved a transfer toward a responsive server, but the file bytes still crossed that server. v11.2.4 added clearer connection and completion messages, browser elapsed time, and a version check that waits until the transfer is over before mentioning an available update. v11.2.5 then tightened the less visible edges: filesystem operations are rooted inside the receive directory, unsafe or ambiguous paths are rejected before writing, archives are completely validated before extraction, local endpoint metadata is encrypted, and relay admission is bounded.",
+      },
+      { type: "heading", text: "v11.3 gives CLI transfers another path" },
+      {
+        type: "paragraph",
+        text: "For a normal internet transfer, the two computers still meet over croc's control connection and use the three-word code for the PAKE exchange. Only after both sides prove that they derived the expected key do v11.3 clients advertise the new capability and exchange a short-lived Tailcat offer over the encrypted channel. The file connection is a separate decision made after authentication, not a replacement for croc's code or handshake.",
+      },
+      { type: "heading", text: "DERP is the introduction and the safety net" },
+      {
+        type: "paragraph",
+        text: "DERP stands for Designated Encrypted Relay for Packets. Tailscale runs a geographically distributed public DERP network to help devices find one another and to relay encrypted packets when a direct connection is not available. Each croc client makes an outbound connection, which generally works even when a home router or firewall would reject an unsolicited inbound connection. Tailcat uses that common meeting point to exchange possible routes and to carry the session while it looks for a direct one.",
+        links: [
+          {
+            label: "public DERP network",
+            href: "https://tailscale.com/docs/reference/derp-servers",
+          },
+          {
+            label: "Tailcat",
+            href: "https://github.com/tailscale/tailcat",
+          },
+        ],
+      },
+      {
+        type: "paragraph",
+        text: "This does not make croc a Tailscale VPN client. There is no Tailscale account, tailnet, tailscaled daemon, or WireGuard configuration involved. v11.3 uses Tailcat to speak to the public DERP infrastructure directly. croc still owns the three-word-code rendezvous, the PAKE-authenticated control channel, the file-transfer protocol, and the encryption applied to the file chunks.",
+        links: [
+          {
+            label: "uses Tailcat",
+            href: "https://github.com/schollz/croc/blob/v11.3.0/src/tailcattransport/transport_supported.go",
+          },
+        ],
+      },
+      {
+        type: "aside",
+        eyebrow: "WHAT PEER-TO-PEER MEANS",
+        title: "A server can make the introduction without carrying the file",
+        text: "Peer-to-peer describes who forwards the file data, not whether any server was contacted. On a direct path, the sender's packets go to the receiver's network endpoint with no DERP or croc relay forwarding them. Servers can still introduce the clients and coordinate that route without being in the file's data path. A transfer that remains on DERP is private and useful, but it is relayed rather than peer-to-peer. A direct path also means the two peers necessarily communicate with—and can observe—one another's public network endpoint. Tailscale makes the same direct-versus-relayed distinction in its connection model.",
+        links: [
+          {
+            label: "direct-versus-relayed distinction",
+            href: "https://tailscale.com/docs/reference/connection-types",
+          },
+        ],
+      },
+      { type: "heading", text: "How two computers behind routers find a direct path" },
+      {
+        type: "paragraph",
+        text: "Most routers perform network address translation, and most firewalls allow replies to an outbound packet while dropping unexpected inbound traffic. The clients gather possible local and public UDP addresses, exchange them through the DERP side channel, and send probes toward one another at nearly the same time. Those outbound probes create temporary mappings that an answering packet can cross. This is UDP hole punching: neither person needs to open a port manually. Tailscale's NAT traversal explainer is a good, detailed account of the moving parts.",
+        links: [
+          {
+            label: "NAT traversal explainer",
+            href: "https://tailscale.com/blog/how-nat-traversal-works",
+          },
+        ],
+      },
+      {
+        type: "paragraph",
+        text: "When a probe succeeds, Tailcat promotes the session to that direct route without restarting the transfer. Some NAT combinations, carrier networks, and firewalls that block UDP will not admit a usable direct path. In those cases DERP keeps forwarding the end-to-end encrypted session. It is the bridge while a direct route is being tested and the safety net when none can be made.",
+      },
+      { type: "heading", text: "Why WireGuard carries the direct stream" },
+      {
+        type: "paragraph",
+        text: "Tailcat builds a small userspace Tailscale network around two PAKE-derived node keys. WireGuard protects packets, magicsock handles endpoint discovery and direct-path promotion, and Tailcat's netstack presents ordinary TCP connections to croc. Croc opens one fixed virtual TCP port per configured stream and installs the complete stream bundle only after every connection is ready.",
+        links: [
+          {
+            label: "WireGuard",
+            href: "https://www.wireguard.com/protocol/",
+          },
+          {
+            label: "Tailcat's netstack",
+            href: "https://github.com/schollz/croc/blob/v11.3.0/src/tailcattransport/transport_supported.go",
+          },
+        ],
+      },
+      {
+        type: "paragraph",
+        text: "WireGuard and Tailcat are the outer transport, not a replacement for croc's security model. croc still applies its own AES-GCM encryption to file chunks whichever route wins. A direct path does not weaken that model, and a relayed path does not expose the file contents to either relay network. The route changes; the shared key and encrypted payload do not.",
+      },
+      { type: "heading", text: "The three possible data paths" },
+      {
+        type: "table",
+        caption: "How a v11.3 CLI-to-CLI transfer can carry file data",
+        headers: ["Path", "Where file bytes travel", "Peer-to-peer?", "When it is used"],
+        rows: [
+          {
+            cells: ["Direct WireGuard", "sender ↔ receiver", "Yes", "Preferred after UDP hole punching finds a working route"],
+            href: "https://www.wireguard.com/protocol/",
+          },
+          {
+            cells: ["Public DERP", "sender → DERP → receiver", "No", "Encrypted fallback when no direct route is available"],
+            href: "https://tailscale.com/docs/reference/derp-servers",
+          },
+          {
+            cells: ["croc relay", "sender → croc relay → receiver", "No", "Compatibility path, or fallback when DERP setup fails"],
+            href: "https://github.com/schollz/croc/blob/v11.3.0/src/croc/croc.go",
+          },
+        ],
+      },
+      {
+        type: "paragraph",
+        text: "The direct path removes a relay from the bulk-data route, so it can reduce latency, increase throughput, and reduce load on public relay infrastructure. It is an opportunity rather than a promise: the route that wins still depends on both networks. The important part is that v11.3 can discover the better path automatically without making reachability a requirement.",
+      },
+      { type: "heading", text: "Fallback is part of the design" },
+      {
+        type: "paragraph",
+        text: "The default is --transport auto. Compatible native clients negotiate the direct/DERP connection together and either accept it together or switch to the croc relay together. An older CLI or a browser does not advertise the capability, so v11.3 uses the established relay data path. This keeps mixed-version and browser-to-terminal transfers working while native clients gain a new route.",
+      },
+      {
+        type: "code",
+        label: "Choose the data transport explicitly",
+        lines: [
+          "# Require direct/DERP setup; fail instead of using croc relay data ports",
+          "$ croc --transport derp send big-file.zip",
+          "",
+          "# Use croc's established parallel TCP relay data path",
+          "$ croc --transport relay send big-file.zip",
+        ],
+      },
+      {
+        type: "paragraph",
+        text: "Stored transfers and local-only transfers keep their existing behavior. DragonFlyBSD and NetBSD builds use the relay path because Tailcat is unavailable on those targets. In ordinary use there is nothing to select: auto is meant to make the best compatible attempt and preserve the old route as the dependable last step.",
+      },
+      { type: "heading", text: "What changed in each release" },
+      {
+        type: "table",
+        caption: "croc v11.2 and v11.3 release sequence",
+        headers: ["Release", "Published", "What it brought"],
+        rows: [
+          {
+            cells: ["v11.2.0", "August 18, 2026", "Three public relays, latency-based selection, deterministic code-to-relay mapping, and matching browser support"],
+            href: "https://github.com/schollz/croc/releases/tag/v11.2.0",
+          },
+          {
+            cells: ["v11.2.1", "August 18, 2026", "Public-relay corrections, deterministic cancellation tests, and repaired Windows signing"],
+            href: "https://github.com/schollz/croc/releases/tag/v11.2.1",
+          },
+          {
+            cells: ["v11.2.2", "August 19, 2026", "Browser link-handling fixes, a security policy, and release-signing maintenance"],
+            href: "https://github.com/schollz/croc/releases/tag/v11.2.2",
+          },
+          {
+            cells: ["v11.2.3", "August 20, 2026", "A TCP fix, the current Go toolchain, dependency maintenance, and automated release tagging"],
+            href: "https://github.com/schollz/croc/releases/tag/v11.2.3",
+          },
+          {
+            cells: ["v11.2.4", "August 20, 2026", "Deferred update notices, clearer terminal status, improved destination details, and browser fixes"],
+            href: "https://github.com/schollz/croc/releases/tag/v11.2.4",
+          },
+          {
+            cells: ["v11.2.5", "August 22, 2026", "Transfer, relay, filesystem, archive, and stored-mode hardening plus browser elapsed time"],
+            href: "https://github.com/schollz/croc/releases/tag/v11.2.5",
+          },
+          {
+            cells: ["v11.3.0", "August 24, 2026", "Automatic CLI-to-CLI Tailcat WireGuard transport with direct promotion, DERP fallback, and coordinated croc relay fallback"],
+            href: "https://github.com/schollz/croc/releases/tag/v11.3.0",
+          },
+        ],
+      },
+      { type: "heading", text: "Try v11.3" },
+      {
+        type: "code",
+        label: "Install the latest release",
+        lines: [
+          "$ curl https://getcroc.com | bash",
+          "$ croc --version",
+          "croc version 11.3.0",
+        ],
+      },
+      {
+        type: "paragraph",
+        text: "Then send and receive exactly as before. I like this change because it removes an old assumption from croc: a relay can be essential for introducing two computers without needing to carry every byte after they meet. When the networks cooperate, it can now get out of the way.",
+      },
+    ],
+  },
   {
     slug: "croc-v11-release-update",
     number: "01",
@@ -923,9 +1541,9 @@ const drafts: DraftBlogPost[] = [
   {
     slug: "compare-file-transfer-tools",
     number: "09",
-    title: "36 ways to send a file",
+    title: "40 ways to send a file",
     description:
-      "Compare croc with 35 file transfer tools by resume support, account requirements, browser and CLI transfers, encryption, availability, and transfer paths.",
+      "Compare croc with 39 file transfer tools by resume support, account requirements, browser and CLI transfers, encryption, availability, and transfer paths.",
     category: "Field guide",
     publishedAt: "2026-08-12",
     publishedLabel: "August 12, 2026",
@@ -940,11 +1558,11 @@ const drafts: DraftBlogPost[] = [
       },
       {
         type: "paragraph",
-        text: "Nine years later, sending a file should be a solved problem. Instead I found 36 solutions and at least four different definitions of the problem. Some make a live pipe between two computers. Some synchronize a folder forever. Some work only while two browser tabs remain awake. Others store a copy and produce a link for somebody who may arrive tomorrow.",
+        text: "Nine years later, sending a file should be a solved problem. Instead I found 40 solutions and at least four different definitions of the problem. Some make a live pipe between two computers. Some synchronize a folder forever. Some work only while two browser tabs remain awake. Others store a copy and produce a link for somebody who may arrive tomorrow.",
       },
       {
         type: "paragraph",
-        text: "This field guide compares croc with 35 file transfer tools, including Magic Wormhole, Syncthing, LocalSend, PairDrop, WeTransfer, MEGA, and Firefox Send. The tables cover resumable transfers, account requirements, browser, command-line, and app endpoints, availability, encryption, and the path each file takes.",
+        text: "This field guide compares croc with 39 file transfer tools, including Magic Wormhole, derphole, Floe, AirPipe, Syncthing, LocalSend, PairDrop, WeTransfer, MEGA, and Firefox Send. The tables cover resumable transfers, account requirements, browser, command-line, and app endpoints, availability, encryption, and the path each file takes.",
       },
       {
         type: "aside",
@@ -952,10 +1570,10 @@ const drafts: DraftBlogPost[] = [
         title: "I know one row from the inside",
         text: "I built croc, so naturally I know that row best. AirDrop, Syncthing, OnionShare, and stored-link services each solve different jobs that croc should not pretend are identical.",
       },
-      { type: "heading", text: "How I compared 36 file transfer tools" },
+      { type: "heading", text: "How I compared 40 file transfer tools" },
       {
         type: "paragraph",
-        text: "I checked official sites, documentation, and repositories on August 12, 2026. A full circle means the project documents that capability without an important limitation. A half-filled circle means it works only on some platforms, in some modes, through a documented third-party adapter, or with another caveat. An empty circle means I could not find documented support. Under Resume, that specifically means I could not find a promise that a stopped transfer can restart without beginning the file at byte zero.",
+        text: "I checked official sites, documentation, and repositories on August 23, 2026. A full circle means the project documents that capability without an important limitation. A half-filled circle means it works only on some platforms, in some modes, through a documented third-party adapter, or with another caveat. An empty circle means I could not find documented support. Under Resume, that specifically means I could not find a promise that a stopped transfer can restart without beginning the file at byte zero.",
       },
       {
         type: "list",
@@ -977,7 +1595,7 @@ const drafts: DraftBlogPost[] = [
       { type: "heading", text: "File transfer tools comparison table" },
       {
         type: "paragraph",
-        text: "Browser means the browser handles the file payload, not merely that a daemon has a web settings page. PairDrop's shell helper opens the browser and hands files to it, so that route is partial. App means a native GUI or mobile application. The complete field is croc plus 35 alternatives.",
+        text: "Browser means the browser handles the file payload, not merely that a daemon has a web settings page. PairDrop's shell helper opens the browser and hands files to it, so that route is partial. App means a native GUI or mobile application. The complete field is croc plus 39 alternatives.",
       },
       {
         type: "table",
@@ -1000,6 +1618,8 @@ const drafts: DraftBlogPost[] = [
           { cells: ["croc", "●", "●", "●", "●", "●", "●", "●"], href: "https://github.com/schollz/croc", highlight: true },
           { cells: ["Magic Wormhole", "●", "●", "○", "○", "○", "● installed command is wormhole", "○"], href: "https://github.com/magic-wormhole/magic-wormhole" },
           { cells: ["iroh Sendme", "◐ example application", "●", "●", "○", "○", "●", "○"], href: "https://github.com/n0-computer/sendme" },
+          { cells: ["derphole", "●", "●", "○", "○", "○", "●", "○"], href: "https://github.com/shayne/derphole" },
+          { cells: ["wormhole-william", "●", "●", "○", "○", "○", "●", "○"], href: "https://github.com/psanford/wormhole-william" },
           { cells: ["ZeroTier Toss", "○ archived; ~7 years (2017–2024)", "●", "○", "○", "○", "●", "○"], href: "https://github.com/zerotier/toss" },
           { cells: ["Portal", "◐ quiet project", "●", "○", "○", "○", "●", "○"], href: "https://github.com/SpatiumPortae/portal" },
           { cells: ["qrcp", "●", "●", "○", "○", "●", "○ CLI endpoint serves a browser page", "○"], href: "https://github.com/claudiodangelis/qrcp" },
@@ -1016,6 +1636,8 @@ const drafts: DraftBlogPost[] = [
           { cells: ["ShareDrop Classic", "○ classic ended; ~11 years (2014–2025)", "●", "○", "●", "○", "○", "○"], href: "https://github.com/ShareDropio/sharedrop" },
           { cells: ["FilePizza", "●", "●", "○", "●", "○", "○", "○"], href: "https://transfer.gattini.ninja/" },
           { cells: ["WebWormhole", "◐ experimental", "●", "○", "●", "●", "● ww send and ww receive", "○"], href: "https://github.com/saljam/webwormhole" },
+          { cells: ["Floe", "●", "●", "○", "●", "●", "●", "◐ Windows desktop beta"], href: "https://github.com/jannskiee/floe" },
+          { cells: ["AirPipe", "●", "●", "○", "●", "●", "●", "○"], href: "https://github.com/Sanyam-G/Airpipe" },
           { cells: ["ToffeeShare", "●", "●", "○", "●", "○", "○", "○"], href: "https://toffeeshare.com/" },
           { cells: ["Wormhole.app", "●", "●", "○", "●", "○", "○ browser service; unrelated to the Magic Wormhole CLI", "○"], href: "https://wormhole.app/" },
           { cells: ["Blaze", "◐ quiet project", "●", "○", "●", "○", "○", "○"], href: "https://blaze.now.sh/" },
@@ -1037,11 +1659,11 @@ const drafts: DraftBlogPost[] = [
       },
       {
         type: "paragraph",
-        text: "The wormhole names need a map. Magic Wormhole installs a command named wormhole and supports CLI-to-CLI transfers. Wormhole.app is a separate browser service with no documented CLI. A newer native app also named Wormhole speaks the Magic Wormhole protocol, but it is not the Wormhole.app website.",
+        text: "The wormhole names need a map. Magic Wormhole installs a command named wormhole. wormhole-william is a separate Go CLI compatible with the Magic Wormhole protocol. WebWormhole uses WebRTC and is another project entirely. Wormhole.app is a browser service with no documented CLI, while a newer native app also named Wormhole speaks the Magic Wormhole protocol but is not the Wormhole.app website.",
       },
       {
         type: "paragraph",
-        text: "Only a few tools bridge browser and terminal worlds. Croc and WebWormhole support all three combinations directly. MEGA and Filemail support terminal upload and download through stored cloud files. Historical Firefox Send could do it through ffsend. Half circles capture less direct routes such as LocalSend's third-party CLI, OpenDrop's experimental AirDrop implementation, and WeTransfer's unofficial transferwee client.",
+        text: "Only a few tools bridge browser and terminal worlds. Croc, WebWormhole, Floe, and AirPipe support all three combinations directly. MEGA and Filemail support terminal upload and download through stored cloud files. Historical Firefox Send could do it through ffsend. Half circles capture less direct routes such as LocalSend's third-party CLI, OpenDrop's experimental AirDrop implementation, and WeTransfer's unofficial transferwee client.",
       },
       {
         type: "paragraph",
@@ -1061,6 +1683,8 @@ const drafts: DraftBlogPost[] = [
           { cells: ["croc", "Application E2EE; PAKE + AES-GCM", "Live relay; optional client-encrypted storage"], href: "https://github.com/schollz/croc", highlight: true },
           { cells: ["Magic Wormhole", "Application E2EE with PAKE", "Live direct or transit relay"], href: "https://github.com/magic-wormhole/magic-wormhole" },
           { cells: ["iroh Sendme", "Authenticated TLS to node ID", "Live hole-punched path or encrypted relay"], href: "https://github.com/n0-computer/sendme" },
+          { cells: ["derphole", "Application E2EE with token-derived AEAD", "Live DERP relay with promotion to direct encrypted UDP"], href: "https://github.com/shayne/derphole" },
+          { cells: ["wormhole-william", "Application E2EE with PAKE", "Live direct or transit relay"], href: "https://github.com/psanford/wormhole-william" },
           { cells: ["ZeroTier Toss", "No encryption; token authentication", "Direct TCP, mainly LAN/virtual LAN"], href: "https://github.com/zerotier/toss" },
           { cells: ["Portal", "Application E2EE with PAKE2", "Live direct connection or relay"], href: "https://github.com/SpatiumPortae/portal" },
           { cells: ["qrcp", "HTTP default; optional user TLS", "Direct HTTP server on LAN"], href: "https://github.com/claudiodangelis/qrcp" },
@@ -1077,6 +1701,8 @@ const drafts: DraftBlogPost[] = [
           { cells: ["ShareDrop Classic", "WebRTC/DTLS", "Peer-to-peer; Firebase signaling"], href: "https://github.com/ShareDropio/sharedrop" },
           { cells: ["FilePizza", "WebRTC/DTLS; optional password", "Peer-to-peer or encrypted TURN relay"], href: "https://transfer.gattini.ninja/" },
           { cells: ["WebWormhole", "PAKE-authenticated WebRTC; unreviewed", "Peer-to-peer or relay"], href: "https://github.com/saljam/webwormhole" },
+          { cells: ["Floe", "WebRTC/DTLS with fingerprint verification", "Peer-to-peer or TURN relay"], href: "https://github.com/jannskiee/floe" },
+          { cells: ["AirPipe", "NaCl secretbox E2EE over WebRTC/DTLS", "Live peer-to-peer or encrypted relay; optional 10-minute mailbox"], href: "https://github.com/Sanyam-G/Airpipe" },
           { cells: ["ToffeeShare", "WebRTC/DTLS", "Peer-to-peer; sender stays online"], href: "https://toffeeshare.com/" },
           { cells: ["Wormhole.app", "Client-side AES-GCM E2EE", "≤5 GB encrypted storage; larger live P2P"], href: "https://wormhole.app/security" },
           { cells: ["Blaze", "WebRTC direct; TLS/WebSocket fallback", "Peer-to-peer or server fallback"], href: "https://github.com/blenderskool/blaze" },
@@ -1135,6 +1761,350 @@ const drafts: DraftBlogPost[] = [
       {
         type: "paragraph",
         text: "That does not make croc the correct answer to every row. I would not replace Syncthing for a continuously mirrored folder, make two iPhone users skip AirDrop, or promise OnionShare's anonymity without Tor. But when I know almost nothing about the computer on the other side, including its operating system, whether its owner likes terminals, or whether the Wi-Fi is about to disappear, croc has become a pretty good default answer to the surprisingly durable question: how do I send this file?",
+      },
+    ],
+  },
+  {
+    slug: "croc-cli-speed-comparison",
+    number: "10",
+    title: "How fast is croc?",
+    description:
+      "I timed eight command-line file-transfer tools between two servers using a 303 MB audio file and a folder of 64 photos.",
+    category: "Benchmarks",
+    publishedAt: "2026-08-23",
+    publishedLabel: "August 23, 2026",
+    author: "schollz",
+    visual: "bridge",
+    takeaway:
+      "Across eight CLI file-transfer tools, croc finished first in both tests; the alternatives took 1.3× to 21.7× as long.",
+    blocks: [
+      {
+        type: "paragraph",
+        text: "I wanted to know how fast croc is compared to other command-line file-transfer tools. So I made two blank cloud servers on opposite sides of the United States and started sending files.",
+      },
+      {
+        type: "paragraph",
+        text: "I timed the command on the receiving computer. The sender was already waiting with a code or ticket, but everything after pressing enter—finding the sender, making the connection, and receiving the file—was on the clock. This seemed like the most useful number because it is the amount of time I actually spend waiting.",
+      },
+      {
+        type: "aside",
+        eyebrow: "THE RESULT",
+        title: "TL;DR",
+        text: "croc was the fastest tool in both tests, averaging 34.8 MB/s across its three timed runs.",
+      },
+      { type: "heading", text: "The experiment" },
+      {
+        type: "paragraph",
+        text: "The sender was a Hetzner server in US West and the receiver was a DigitalOcean server in US East. This made every file cross both the country and two different cloud providers.",
+      },
+      {
+        type: "list",
+        items: [
+          "One 303 MB audio file.",
+          "One folder with 64 photos totaling 755.8 MB.",
+          "The same two servers and the same files for every tool.",
+          "One timed run for each tool or croc mode.",
+        ],
+      },
+      {
+        type: "code",
+        label: "The command I timed",
+        lines: [
+          "$ time <receiver command>",
+          "# The sender was already waiting with its code or ticket.",
+        ],
+      },
+      { type: "heading", text: "One audio file" },
+      {
+        type: "table",
+        caption: "303 MB audio file from US West to US East",
+        headers: ["Tool", "Elapsed", "Effective rate", "Relative time"],
+        rows: [
+          {
+            cells: ["croc", "7.2 s", "42.1 MB/s", "baseline"],
+            href: "https://github.com/schollz/croc",
+            highlight: true,
+          },
+          {
+            cells: ["derphole", "9.6 s", "31.6 MB/s", "1.3× croc time"],
+            href: "https://github.com/shayne/derphole",
+          },
+          {
+            cells: ["Magic Wormhole", "11.5 s", "26.3 MB/s", "1.6× croc time"],
+            href: "https://github.com/magic-wormhole/magic-wormhole",
+          },
+          {
+            cells: ["iroh Sendme", "20.7 s", "14.6 MB/s", "2.9× croc time"],
+            href: "https://github.com/n0-computer/sendme",
+          },
+          {
+            cells: ["wormhole-william", "42.4 s", "7.15 MB/s", "5.9× croc time"],
+            href: "https://github.com/psanford/wormhole-william",
+          },
+          {
+            cells: ["AirPipe", "110.0 s", "2.75 MB/s", "15.3× croc time"],
+            href: "https://github.com/Sanyam-G/Airpipe",
+          },
+          {
+            cells: ["Floe", "116.6 s", "2.60 MB/s", "16.2× croc time"],
+            href: "https://github.com/jannskiee/floe",
+          },
+          {
+            cells: ["WebWormhole", "156.5 s", "1.94 MB/s", "21.7× croc time"],
+            href: "https://github.com/saljam/webwormhole",
+          },
+        ],
+      },
+      {
+        type: "paragraph",
+        text: "The effective rate is just 303 MB divided by the time. It includes connection setup, protocol overhead, and possibly compression, so it is not the raw speed of the network. Still, it makes the wait easy to compare.",
+      },
+      { type: "heading", text: "A folder of photos" },
+      {
+        type: "table",
+        caption: "64 photos totaling 755.8 MB from US West to US East",
+        headers: ["Tool", "Elapsed", "Effective rate", "Relative time"],
+        rows: [
+          {
+            cells: ["croc --zip", "20.0 s", "37.8 MB/s", "baseline"],
+            href: "https://github.com/schollz/croc",
+            highlight: true,
+          },
+          {
+            cells: ["croc", "30.9 s", "24.5 MB/s", "1.5× zip time"],
+            href: "https://github.com/schollz/croc",
+            highlight: true,
+          },
+          {
+            cells: ["derphole", "34.9 s", "21.7 MB/s", "1.7× zip time"],
+            href: "https://github.com/shayne/derphole",
+          },
+          {
+            cells: ["Magic Wormhole", "40.1 s", "18.8 MB/s", "2.0× zip time"],
+            href: "https://github.com/magic-wormhole/magic-wormhole",
+          },
+          {
+            cells: ["iroh Sendme", "69.4 s", "10.9 MB/s", "3.5× zip time"],
+            href: "https://github.com/n0-computer/sendme",
+          },
+          {
+            cells: ["wormhole-william", "91.7 s", "8.24 MB/s", "4.6× zip time"],
+            href: "https://github.com/psanford/wormhole-william",
+          },
+          {
+            cells: ["AirPipe", "231.4 s", "3.27 MB/s", "11.6× zip time"],
+            href: "https://github.com/Sanyam-G/Airpipe",
+          },
+          {
+            cells: ["Floe", "354.9 s", "2.13 MB/s", "17.7× zip time"],
+            href: "https://github.com/jannskiee/floe",
+          },
+        ],
+      },
+      {
+        type: "paragraph",
+        text: "Pre-zipping made a surprisingly big difference for croc: it went from 30.9 seconds to 20.0 seconds, about 35% faster. WebWormhole is missing from this table because ww cannot send a folder. AirPipe did send the folder, but left it as a ZIP on the receiver, so its time does not include unpacking the photos. I used the original 755.8 MB folder size for all of the effective rates.",
+      },
+      { type: "heading", text: "How the tools move a file" },
+      {
+        type: "paragraph",
+        text: "The commands all look about the same, but underneath they move files in very different ways. I read through the documentation and source code to see what each one was doing.",
+      },
+      {
+        type: "table",
+        caption: "How each tool moves the data",
+        headers: ["Tool", "Transport"],
+        rows: [
+          {
+            cells: [
+              "croc",
+              "AES-GCM chunks over multiple parallel relay TCP connections, with a local-network shortcut when available",
+            ],
+            href: "https://github.com/schollz/croc",
+            highlight: true,
+          },
+          {
+            cells: [
+              "derphole",
+              "DERP for rendezvous and fallback, with paced direct UDP lanes when available",
+            ],
+            href: "https://github.com/shayne/derphole",
+          },
+          {
+            cells: [
+              "Magic Wormhole",
+              "One encrypted Wormhole Transit TCP connection, either direct or through a relay",
+            ],
+            href: "https://github.com/magic-wormhole/magic-wormhole",
+          },
+          {
+            cells: [
+              "wormhole-william",
+              "One encrypted TCP connection using the same Wormhole Transit protocol family",
+            ],
+            href: "https://github.com/psanford/wormhole-william",
+          },
+          {
+            cells: [
+              "iroh Sendme",
+              "iroh QUIC over a hole-punched direct path or encrypted relay, with verified blobs",
+            ],
+            href: "https://github.com/n0-computer/sendme",
+          },
+          {
+            cells: [
+              "Floe",
+              "One reliable WebRTC data channel, direct through ICE or relayed through TURN",
+            ],
+            href: "https://github.com/jannskiee/floe",
+          },
+          {
+            cells: [
+              "AirPipe",
+              "One reliable WebRTC data channel, with an encrypted WebSocket relay fallback",
+            ],
+            href: "https://github.com/Sanyam-G/Airpipe",
+          },
+          {
+            cells: [
+              "WebWormhole",
+              "One reliable WebRTC data channel, direct through ICE or relayed through TURN",
+            ],
+            href: "https://github.com/saljam/webwormhole",
+          },
+        ],
+      },
+      {
+        type: "paragraph",
+        text: "croc, derphole, and Magic Wormhole were fast for fairly simple reasons. croc keeps several TCP connections busy at once, derphole can switch to paced direct UDP, and Magic Wormhole uses one straightforward Transit TCP stream. croc also compresses data when it is worthwhile. For the folder, --zip turned 64 little transfers into one long transfer, which seems to be much easier.",
+      },
+      {
+        type: "paragraph",
+        text: "Sendme and wormhole-william ended up in the middle. Both do extra work around the transfer: Sendme verifies and stages its blobs before exporting them, while wormhole-william writes a temporary ZIP and then extracts it. That extra work is useful, but it also takes time.",
+      },
+      {
+        type: "paragraph",
+        text: "Floe, AirPipe, and WebWormhole were the slowest, and all three use one reliable WebRTC data channel. They may have found a poor direct route, fallen back to a relay, or simply kept too little data moving over this long connection. Floe also waits for an acknowledgment between files, which becomes noticeable with 64 photos. I cannot tell which part mattered most from the timings alone, but the grouping is striking.",
+      },
+      { type: "heading", text: "croc is the fastest" },
+      {
+        type: "paragraph",
+        text: "For this trip across the country, croc was the fastest. derphole and Magic Wormhole were not far behind, and pre-zipping the folder helped even more. I would like to repeat the experiment and save the route chosen by each tool, because direct versus relayed traffic could explain a lot. But the useful result is already simple: after I pressed enter on the receiver, croc made me wait the least.",
+      },
+      { type: "heading", text: "Install and run" },
+      {
+        type: "paragraph",
+        text: "These are the commands I used. The sender was already showing a code or ticket before I started time on the receiver.",
+      },
+      {
+        type: "details",
+        summary: "croc — 7.2 seconds",
+        lines: [
+          "$ curl https://getcroc.com | bash",
+          "",
+          "# Sender",
+          "$ croc send audio.wav",
+          "",
+          "# Receiver: replace YOUR-CODE with the code from the sender",
+          "$ time croc YOUR-CODE",
+          "",
+          "# Folder sender, without and with pre-zipping",
+          "$ croc send photos/",
+          "$ croc send --zip photos/",
+        ],
+      },
+      {
+        type: "details",
+        summary: "WebWormhole — 156.5 seconds for audio; folders unsupported",
+        lines: [
+          "$ go install webwormhole.io/cmd/ww@latest",
+          "",
+          "# Sender",
+          "$ ww send audio.wav",
+          "",
+          "# Receiver",
+          "$ time ww receive YOUR-CODE",
+        ],
+      },
+      {
+        type: "details",
+        summary: "wormhole-william — 42.4 seconds for audio; 91.7 seconds for photos",
+        lines: [
+          "$ go install github.com/psanford/wormhole-william@latest",
+          "",
+          "# Sender",
+          "$ wormhole-william send audio.wav",
+          "$ wormhole-william send photos/",
+          "",
+          "# Receiver",
+          "$ time wormhole-william receive YOUR-CODE",
+        ],
+      },
+      {
+        type: "details",
+        summary: "iroh Sendme — 20.7 seconds",
+        lines: [
+          "$ cargo install sendme",
+          "",
+          "# Sender",
+          "$ sendme send audio.wav",
+          "",
+          "# Receiver",
+          "$ time sendme receive 'YOUR-TICKET'",
+        ],
+      },
+      {
+        type: "details",
+        summary: "Magic Wormhole — 11.5 seconds",
+        lines: [
+          "$ pipx install magic-wormhole",
+          "",
+          "# Sender",
+          "$ wormhole send audio.wav",
+          "",
+          "# Receiver",
+          "$ time wormhole receive YOUR-CODE",
+        ],
+      },
+      {
+        type: "details",
+        summary: "Floe — 116.6 seconds for audio; 354.9 seconds for photos",
+        lines: [
+          "$ curl -fsSL https://floe.one/install.sh | sh",
+          "",
+          "# Sender",
+          "$ floe send audio.wav",
+          "",
+          "# Receiver",
+          "$ time floe receive YOUR-CODE",
+        ],
+      },
+      {
+        type: "details",
+        summary: "AirPipe — 110.0 seconds for audio; 231.4 seconds for photos",
+        lines: [
+          "$ curl -sSL https://airpipe.sanyamgarg.com/install.sh | sh",
+          "",
+          "# Sender: choose the live transfer mode",
+          "$ airpipe send audio.wav",
+          "",
+          "# Receiver",
+          "$ time airpipe download YOUR-PASSPHRASE",
+        ],
+      },
+      {
+        type: "details",
+        summary: "derphole — 9.6 seconds for audio; 34.9 seconds for photos",
+        lines: [
+          "# Download the matching binary from GitHub Releases",
+          "# https://github.com/shayne/derphole/releases/latest",
+          "",
+          "# Sender",
+          "$ derphole send audio.wav",
+          "",
+          "# Receiver",
+          "$ time derphole receive YOUR-CODE",
+        ],
       },
     ],
   },

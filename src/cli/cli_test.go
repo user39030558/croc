@@ -5,6 +5,8 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
+	"net"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -18,7 +20,76 @@ import (
 	"github.com/schollz/croc/v11/src/models"
 	"github.com/schollz/croc/v11/src/publicrelay"
 	"github.com/schollz/croc/v11/src/tcp"
+	"github.com/stretchr/testify/require"
 )
+
+type blockingCLIReader struct {
+	started chan struct{}
+	release chan struct{}
+}
+
+func (r *blockingCLIReader) Read([]byte) (int, error) {
+	select {
+	case <-r.started:
+	default:
+		close(r.started)
+	}
+	<-r.release
+	return 0, io.EOF
+}
+
+func TestCopyStdinContextCancelsAndRemovesTemporaryFile(t *testing.T) {
+	t.Chdir(t.TempDir())
+	reader := &blockingCLIReader{started: make(chan struct{}), release: make(chan struct{})}
+	defer close(reader.release)
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		_, err := copyStdinContext(ctx, reader)
+		result <- err
+	}()
+	<-reader.started
+	started := time.Now()
+	cancel()
+	select {
+	case err := <-result:
+		require.ErrorIs(t, err, context.Canceled)
+		require.Less(t, time.Since(started), 500*time.Millisecond)
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("stdin copy did not stop after cancellation")
+	}
+	matches, err := filepath.Glob("croc-stdin-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	require.Empty(t, matches, "canceled stdin copy left a temporary file")
+}
+
+func TestSendHandlesUnavailableStdin(t *testing.T) {
+	stdin, err := os.CreateTemp(t.TempDir(), "closed-stdin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := stdin.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if stat, err := stdin.Stat(); err == nil || stat != nil {
+		t.Fatalf("closed stdin Stat() = (%v, %v), want (nil, error)", stat, err)
+	}
+
+	oldStdin := os.Stdin
+	os.Stdin = stdin
+	t.Cleanup(func() { os.Stdin = oldStdin })
+	t.Setenv("CROC_DO_CHECK", "0")
+
+	for _, args := range [][]string{
+		{"croc", "send"},
+		{"croc", "--ignore-stdin", "send"},
+	} {
+		err := newApp().Run(args)
+		require.EqualError(t, err, "must specify file: croc send [filename(s) or folder]")
+	}
+}
 
 func TestRelayMaxRoomsOpenConfiguration(t *testing.T) {
 	t.Run("default", func(t *testing.T) {
@@ -59,6 +130,49 @@ func TestRelayRejectsNonPositiveMaxRoomsOpen(t *testing.T) {
 				t.Fatalf("unexpected error: %q", got)
 			}
 		})
+	}
+}
+
+func TestRelayStopsPromptlyWhenCommandContextIsCanceled(t *testing.T) {
+	listeners := make([]net.Listener, 0, 2)
+	ports := make([]string, 0, 2)
+	for range 2 {
+		listener, err := net.Listen("tcp4", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		listeners = append(listeners, listener)
+		_, port, err := net.SplitHostPort(listener.Addr().String())
+		if err != nil {
+			t.Fatal(err)
+		}
+		ports = append(ports, port)
+	}
+	for _, listener := range listeners {
+		_ = listener.Close()
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		result <- newApp().RunContext(ctx, []string{
+			"croc", "relay", "--host", "127.0.0.1", "--ports", strings.Join(ports, ","),
+		})
+	}()
+	address := net.JoinHostPort("127.0.0.1", ports[0])
+	require.Eventually(t, func() bool { return tcp.PingServer(address) == nil }, 2*time.Second, 10*time.Millisecond)
+	started := time.Now()
+	cancel()
+	select {
+	case err := <-result:
+		if err != nil && !errors.Is(err, context.Canceled) {
+			t.Fatalf("relay cancellation returned %v", err)
+		}
+		if elapsed := time.Since(started); elapsed >= 500*time.Millisecond {
+			t.Fatalf("relay cancellation took %s", elapsed)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("relay did not stop after command context cancellation")
 	}
 }
 
@@ -329,6 +443,120 @@ func TestRevokeIsRootFlag(t *testing.T) {
 	}
 }
 
+func TestTransportIsSendOnlyAndDefaultsToAuto(t *testing.T) {
+	app := newApp()
+	var got string
+	var sendHasTransport bool
+	for _, command := range app.Commands {
+		if command.Name == "send" {
+			for _, sendFlag := range command.Flags {
+				if sendFlag.Names()[0] == "transport" {
+					sendHasTransport = true
+					break
+				}
+			}
+			command.Action = func(ctx *cli.Context) error {
+				got = ctx.String("transport")
+				return nil
+			}
+		}
+	}
+	if err := app.Run([]string{"croc", "send"}); err != nil {
+		t.Fatalf("parse default transport: %v", err)
+	}
+	if got != "auto" {
+		t.Fatalf("default transport = %q, want auto", got)
+	}
+	if err := app.Run([]string{"croc", "send", "--transport", "derp"}); err != nil {
+		t.Fatalf("parse --transport derp: %v", err)
+	}
+	if got != "derp" {
+		t.Fatalf("transport = %q, want derp", got)
+	}
+	if !sendHasTransport {
+		t.Fatal("--transport is not registered on the send command")
+	}
+	for _, rootFlag := range app.Flags {
+		if rootFlag.Names()[0] == "transport" {
+			t.Fatal("--transport must not be registered as a root flag")
+		}
+	}
+	if err := newApp().Run([]string{"croc", "--transport", "derp", "code"}); err == nil || !strings.Contains(err.Error(), "flag provided but not defined") {
+		t.Fatalf("receiver-side --transport error = %v", err)
+	}
+}
+
+func TestTransportRejectsInvalidValuesAndIncompatibleCLIOptions(t *testing.T) {
+	type transportErrorTest struct {
+		name string
+		args []string
+		want string
+	}
+	tests := []transportErrorTest{
+		{
+			name: "invalid",
+			args: []string{"croc", "--ignore-stdin", "send", "--transport", "magic", "--text", "hello"},
+			want: `invalid transport "magic" (choose auto, derp, or relay)`,
+		},
+		{
+			name: "local derp",
+			args: []string{"croc", "--local", "--ignore-stdin", "send", "--transport", "derp", "--text", "hello"},
+			want: "--transport must be auto for local-only transfers",
+		},
+		{
+			name: "local relay",
+			args: []string{"croc", "--local", "--ignore-stdin", "send", "--transport", "relay", "--text", "hello"},
+			want: "--transport must be auto for local-only transfers",
+		},
+		{
+			name: "stored derp",
+			args: []string{"croc", "--ignore-stdin", "send", "--transport", "derp", "--store", "unused"},
+			want: "--transport must be auto for stored transfers",
+		},
+		{
+			name: "stored relay",
+			args: []string{"croc", "--ignore-stdin", "send", "--transport", "relay", "--store", "unused"},
+			want: "--transport must be auto for stored transfers",
+		},
+	}
+	if _, downgraded, err := croc.ResolveTransportMode(string(croc.TransportDERP)); err != nil {
+		t.Fatal(err)
+	} else if !downgraded {
+		tests = append(tests, transportErrorTest{
+			name: "qrcode",
+			args: []string{"croc", "--ignore-stdin", "send", "--transport", "derp", "--qrcode", "unused"},
+			want: "--transport derp cannot be combined with --qrcode",
+		})
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := newApp().Run(test.args)
+			if err == nil || err.Error() != test.want {
+				t.Fatalf("error = %v, want %q", err, test.want)
+			}
+		})
+	}
+}
+
+func TestSendHashDefaultsToXXHash(t *testing.T) {
+	app := newApp()
+	var algorithm string
+	for _, command := range app.Commands {
+		if command.Name == "send" {
+			command.Action = func(ctx *cli.Context) error {
+				algorithm = ctx.String("hash")
+				return nil
+			}
+		}
+	}
+	if err := app.Run([]string{"croc", "send"}); err != nil {
+		t.Fatal(err)
+	}
+	if algorithm != "xxhash" {
+		t.Fatalf("default hash = %q", algorithm)
+	}
+}
+
 func TestStoreDownloadsFlagParsing(t *testing.T) {
 	for _, testCase := range []struct {
 		name string
@@ -584,12 +812,71 @@ func TestSelectBestPublicRelay(t *testing.T) {
 			return 0, errors.New("unavailable")
 		}
 	}
-	index, err := selectBestPublicRelay(probe)
+	index, err := selectBestPublicRelay(context.Background(), probe)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if index != 1 {
 		t.Fatalf("best relay index = %d, want 1", index)
+	}
+}
+
+func TestSelectBestPublicRelayHonorsCommandCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	startedProbe := make(chan struct{}, len(publicrelay.Relays()))
+	probe := func(ctx context.Context, _ string, _ time.Duration) (time.Duration, error) {
+		startedProbe <- struct{}{}
+		<-ctx.Done()
+		return 0, ctx.Err()
+	}
+	result := make(chan error, 1)
+	go func() {
+		_, err := selectBestPublicRelay(ctx, probe)
+		result <- err
+	}()
+	<-startedProbe
+	started := time.Now()
+	cancel()
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("relay selection cancellation returned %v", err)
+		}
+		if elapsed := time.Since(started); elapsed >= 500*time.Millisecond {
+			t.Fatalf("relay selection cancellation took %s", elapsed)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("relay selection did not stop after cancellation")
+	}
+}
+
+func TestStoredSendHonorsCommandCancellation(t *testing.T) {
+	configDirectory := t.TempDir()
+	t.Setenv("CROC_CONFIG_DIR", configDirectory)
+	if err := writeVersionCheckCache(filepath.Join(configDirectory, versionCheckCacheName), versionCheckCache{
+		CheckedAt: time.Now().UTC(), LatestVersion: Version,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	file := filepath.Join(t.TempDir(), "payload.txt")
+	if err := os.WriteFile(file, []byte("payload"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	for _, command := range [][]string{{"send", "--store"}, {"store"}} {
+		t.Run(command[0], func(t *testing.T) {
+			started := time.Now()
+			args := append([]string{"croc", "--ignore-stdin"}, command...)
+			args = append(args, file)
+			err := newApp().RunContext(ctx, args)
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("stored send cancellation returned %v", err)
+			}
+			if elapsed := time.Since(started); elapsed >= 500*time.Millisecond {
+				t.Fatalf("stored send cancellation took %s", elapsed)
+			}
+		})
 	}
 }
 
@@ -633,7 +920,7 @@ func TestSelectPublicRelayCacheHitBypassesProbes(t *testing.T) {
 		t.Fatal(err)
 	}
 	probes := 0
-	index, err := selectPublicRelay(func(context.Context, string, time.Duration) (time.Duration, error) {
+	index, err := selectPublicRelay(context.Background(), func(context.Context, string, time.Duration) (time.Duration, error) {
 		probes++
 		return 0, errors.New("probe should not run")
 	})
@@ -654,7 +941,7 @@ func TestSelectPublicRelayReplacesInvalidCache(t *testing.T) {
 				t.Fatal(err)
 			}
 			winner := publicrelay.Relays()[1]
-			index, err := selectPublicRelay(func(ctx context.Context, address string, _ time.Duration) (time.Duration, error) {
+			index, err := selectPublicRelay(context.Background(), func(ctx context.Context, address string, _ time.Duration) (time.Duration, error) {
 				if address == winner {
 					return time.Millisecond, nil
 				}
@@ -685,7 +972,7 @@ func TestSelectPublicRelayIgnoresCacheWriteFailure(t *testing.T) {
 	}
 	t.Setenv("CROC_CONFIG_DIR", configPath)
 	winner := publicrelay.Relays()[0]
-	index, err := selectPublicRelay(func(ctx context.Context, address string, _ time.Duration) (time.Duration, error) {
+	index, err := selectPublicRelay(context.Background(), func(ctx context.Context, address string, _ time.Duration) (time.Duration, error) {
 		if address == winner {
 			return time.Millisecond, nil
 		}
@@ -837,6 +1124,75 @@ func TestApplyRememberedSendOptionsDisableClipboard(t *testing.T) {
 				return
 			}
 			t.Fatal("send command not found")
+		})
+	}
+}
+
+func TestApplyRememberedSendOptionsTransport(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		args       []string
+		remembered croc.TransportMode
+		want       croc.TransportMode
+	}{
+		{
+			name:       "inherits remembered DERP",
+			args:       []string{"croc", "send"},
+			remembered: croc.TransportDERP,
+			want:       croc.TransportDERP,
+		},
+		{
+			name:       "explicit relay overrides remembered DERP",
+			args:       []string{"croc", "send", "--transport", "relay"},
+			remembered: croc.TransportDERP,
+			want:       croc.TransportRelay,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			app := newApp()
+			for _, command := range app.Commands {
+				if command.Name != "send" {
+					continue
+				}
+				command.Action = func(ctx *cli.Context) error {
+					got, err := croc.ParseTransportMode(ctx.String("transport"))
+					if err != nil {
+						return err
+					}
+					options := croc.Options{Transport: got}
+					applyRememberedSendOptions(ctx, &options, croc.Options{Transport: test.remembered})
+					if options.Transport != test.want {
+						t.Fatalf("Transport = %q, want %q", options.Transport, test.want)
+					}
+					return nil
+				}
+				if err := app.Run(test.args); err != nil {
+					t.Fatal(err)
+				}
+				return
+			}
+			t.Fatal("send command not found")
+		})
+	}
+}
+
+func TestWriteTailcatRelayFallbackWarning(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		quiet      bool
+		downgraded bool
+		want       string
+	}{
+		{name: "downgraded", downgraded: true, want: tailcatRelayFallbackWarning + "\n"},
+		{name: "quiet", quiet: true, downgraded: true},
+		{name: "unchanged"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var output strings.Builder
+			writeTailcatRelayFallbackWarning(&output, test.quiet, test.downgraded)
+			if got := output.String(); got != test.want {
+				t.Fatalf("warning output = %q; want %q", got, test.want)
+			}
 		})
 	}
 }

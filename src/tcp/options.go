@@ -2,11 +2,21 @@ package tcp
 
 import (
 	"fmt"
+	"slices"
 	"time"
 )
 
 // TODO: maybe export from logger library?
 var availableLogLevels = []string{"info", "error", "warn", "debug", "trace"}
+
+// RoomProtocol identifies an application protocol that a relay can recognize
+// from fixed metadata without inspecting encrypted application data.
+type RoomProtocol string
+
+const (
+	// RoomProtocolSSH is croc's shared SSH terminal rendezvous protocol.
+	RoomProtocolSSH RoomProtocol = "ssh"
+)
 
 type serverOptsFunc func(s *server) error
 
@@ -94,6 +104,28 @@ func WithRoomPairedCallback(callback func()) serverOptsFunc {
 	}
 }
 
+// WithRoomProtocolCallback sets a callback invoked once when a paired room
+// advertises a recognized application protocol. The callback must not block.
+func WithRoomProtocolCallback(callback func(RoomProtocol)) serverOptsFunc {
+	return func(s *server) error {
+		s.roomProtocol = callback
+		return nil
+	}
+}
+
+// WithFastAdmission shares one capability key and replay set across every
+// advertised port of a relay process.
+func WithFastAdmission(capabilities *RelayCapabilitySet) serverOptsFunc {
+	return func(s *server) error {
+		if capabilities == nil {
+			return fmt.Errorf("fast admission capability set is required")
+		}
+		s.fastAdmission = capabilities
+		capabilities.registerPort()
+		return nil
+	}
+}
+
 func WithRoomCleanupInterval(interval time.Duration) serverOptsFunc {
 	return func(s *server) error {
 		s.roomCleanupInterval = interval
@@ -109,10 +141,5 @@ func WithRoomTTL(ttl time.Duration) serverOptsFunc {
 }
 
 func containsSlice(s []string, e string) bool {
-	for _, ss := range s {
-		if e == ss {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(s, e)
 }

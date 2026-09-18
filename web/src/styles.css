@@ -77,6 +77,33 @@ a:focus-visible {
   padding: 52px 0 24px;
 }
 
+.workspace-toolbar {
+  display: flex;
+  gap: 18px;
+  align-items: center;
+  justify-content: space-between;
+  border-top: 1px solid var(--foreground);
+  border-right: 1px solid var(--foreground);
+  border-left: 1px solid var(--foreground);
+  padding: 12px;
+  background: var(--background);
+}
+
+.workspace-toolbar .workspace-switch {
+  margin-bottom: 0;
+}
+
+.workspace-toolbar-actions {
+  display: flex;
+  gap: 0;
+  align-items: center;
+  margin-left: auto;
+}
+
+.workspace-toolbar-actions > * + * {
+  border-left: 0;
+}
+
 .donation-banner {
   display: grid;
   grid-template-columns: 1fr auto;
@@ -130,7 +157,7 @@ a:focus-visible {
 
 .site-header {
   display: grid;
-  grid-template-columns: auto 1fr auto;
+  grid-template-columns: auto 1fr;
   gap: 18px;
   align-items: center;
   padding-bottom: 30px;
@@ -192,10 +219,42 @@ h1 {
   height: 18px;
 }
 
-.header-actions {
-  display: flex;
+.workspace-switch {
+  display: inline-grid;
+  grid-template-columns: 1fr 1fr;
+  margin-bottom: 16px;
+  border: 1px solid var(--foreground);
+  background: var(--background);
+}
+
+.workspace-switch button {
+  display: inline-flex;
+  min-width: 116px;
+  min-height: 42px;
   gap: 8px;
   align-items: center;
+  justify-content: center;
+  border: 0;
+  padding: 9px 16px;
+  color: var(--muted);
+  background: transparent;
+  font-size: 12px;
+  font-weight: 750;
+  cursor: pointer;
+}
+
+.workspace-switch button + button {
+  border-left: 1px solid var(--foreground);
+}
+
+.workspace-switch button[aria-selected="true"] {
+  color: var(--background);
+  background: var(--foreground);
+}
+
+.workspace-switch svg {
+  width: 16px;
+  height: 16px;
 }
 
 .transfer-grid {
@@ -263,6 +322,172 @@ h1 {
   color: var(--muted);
   font-size: 12px;
   line-height: 1.55;
+}
+
+.panel-heading code {
+  color: var(--foreground);
+}
+
+.ssh-workspace {
+  border-top: 1px solid var(--foreground);
+  border-left: 1px solid var(--foreground);
+}
+
+.ssh-panel {
+  min-height: 650px;
+}
+
+.ssh-loading {
+  min-height: 180px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.ssh-heading {
+  grid-template-columns: auto minmax(0, 1fr) auto;
+}
+
+.ssh-role {
+  align-self: center;
+  border: 1px solid var(--soft-border);
+  padding: 6px 9px;
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 750;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.ssh-role.read-write {
+  color: var(--background);
+  border-color: var(--foreground);
+  background: var(--foreground);
+}
+
+.ssh-join-form {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: end;
+  margin-bottom: 14px;
+}
+
+.ssh-invitation-field {
+  min-width: 0;
+}
+
+.ssh-invitation-field > label {
+  display: block;
+  margin-bottom: 7px;
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 750;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+.ssh-join-form > .primary-button {
+  width: auto;
+  min-height: 42px;
+  margin-top: 0;
+  white-space: nowrap;
+}
+
+.ssh-code-input {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 42px;
+}
+
+.ssh-code-input input {
+  border-right: 0;
+}
+
+.ssh-code-input button {
+  display: grid;
+  width: 42px;
+  height: 42px;
+  place-items: center;
+  border: 1px solid var(--subtle);
+  padding: 0;
+  color: var(--foreground);
+  background: var(--background);
+  cursor: pointer;
+}
+
+.ssh-code-input button:hover:not(:disabled) {
+  color: var(--background);
+  border-color: var(--foreground);
+  background: var(--foreground);
+}
+
+.ssh-code-input svg {
+  width: 15px;
+  height: 15px;
+}
+
+.ssh-status-row {
+  display: flex;
+  min-height: 24px;
+  gap: 8px;
+  align-items: center;
+  margin-bottom: 8px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.status-dot {
+  width: 7px;
+  height: 7px;
+  flex: 0 0 auto;
+  border: 1px solid var(--subtle);
+  background: transparent;
+}
+
+.status-dot.connected {
+  border-color: var(--foreground);
+  background: var(--foreground);
+}
+
+.ssh-terminal {
+  min-height: 360px;
+  height: clamp(360px, 54vh, 560px);
+  overflow: hidden;
+  border: 1px solid var(--soft-border);
+  padding: 10px;
+  background: var(--panel-tint);
+}
+
+.ssh-terminal .xterm {
+  height: 100%;
+}
+
+.ssh-actions {
+  display: grid;
+  grid-template-columns: minmax(0, 240px) minmax(0, 1fr);
+  gap: 16px;
+  align-items: center;
+  margin-top: 14px;
+}
+
+.ssh-actions .primary-button {
+  margin-top: 0;
+}
+
+.ssh-actions p {
+  display: flex;
+  grid-column: 1 / -1;
+  gap: 8px;
+  align-items: flex-start;
+  margin: 0;
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.5;
+}
+
+.ssh-actions p svg {
+  width: 14px;
+  height: 14px;
+  flex: 0 0 auto;
 }
 
 .drop-zone {
@@ -1559,7 +1784,7 @@ a.cli-download-primary:hover {
   display: grid;
   min-width: 0;
   min-height: 118px;
-  grid-template-columns: auto minmax(0, 1fr) auto;
+  grid-template-columns: minmax(0, 1fr) auto;
   grid-template-rows: 1fr auto;
   gap: 8px 12px;
   align-items: start;
@@ -1576,7 +1801,6 @@ a.cli-download-primary:hover {
   background: var(--foreground);
 }
 
-.home-blog-list span,
 .home-blog-list small {
   color: var(--muted);
   font-size: 9px;
@@ -1589,17 +1813,15 @@ a.cli-download-primary:hover {
 }
 
 .home-blog-list small {
-  grid-column: 2;
+  grid-column: 1;
 }
 
 .home-blog-list svg {
   grid-row: 1 / -1;
-  grid-column: 3;
+  grid-column: 2;
 }
 
-.home-blog-list a:hover span,
 .home-blog-list a:hover small,
-.home-blog-list a:focus-visible span,
 .home-blog-list a:focus-visible small {
   color: inherit;
 }
@@ -2463,7 +2685,11 @@ a.cli-download-primary:hover {
   opacity: 0.55;
 }
 
-.release-visual {
+.release-visual,
+.derp-visual,
+.ssh-visual,
+.ssh-release-visual,
+.update-release-visual {
   display: grid;
   width: min(100%, 650px);
   grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -2472,7 +2698,11 @@ a.cli-download-primary:hover {
   background: var(--background);
 }
 
-.release-visual > span {
+.release-visual > span,
+.derp-visual > span,
+.ssh-visual > span,
+.ssh-release-visual > span,
+.update-release-visual > span {
   display: grid;
   min-height: 150px;
   gap: 9px;
@@ -2484,33 +2714,57 @@ a.cli-download-primary:hover {
   text-align: center;
 }
 
-.release-visual > span:nth-child(2) {
+.release-visual > span:nth-child(2),
+.derp-visual > span:nth-child(2),
+.ssh-visual > span:nth-child(2),
+.ssh-release-visual > span:nth-child(2),
+.update-release-visual > span:nth-child(2) {
   color: var(--background);
   background: var(--foreground);
 }
 
-.release-visual svg {
+.release-visual svg,
+.derp-visual svg,
+.ssh-visual svg,
+.ssh-release-visual svg,
+.update-release-visual svg {
   width: 28px;
   height: 28px;
 }
 
-.release-visual small {
+.release-visual small,
+.derp-visual small,
+.ssh-visual small,
+.ssh-release-visual small,
+.update-release-visual small {
   color: var(--muted);
   font-size: 8px;
   text-transform: uppercase;
 }
 
-.release-visual > span:nth-child(2) small {
+.release-visual > span:nth-child(2) small,
+.derp-visual > span:nth-child(2) small,
+.ssh-visual > span:nth-child(2) small,
+.ssh-release-visual > span:nth-child(2) small,
+.update-release-visual > span:nth-child(2) small {
   color: inherit;
 }
 
-.release-visual strong {
+.release-visual strong,
+.derp-visual strong,
+.ssh-visual strong,
+.ssh-release-visual strong,
+.update-release-visual strong {
   font-size: 13px;
   letter-spacing: -0.04em;
   text-transform: uppercase;
 }
 
-.release-visual > i {
+.release-visual > i,
+.derp-visual > i,
+.ssh-visual > i,
+.ssh-release-visual > i,
+.update-release-visual > i {
   display: grid;
   min-height: 44px;
   grid-column: 1 / -1;
@@ -2869,6 +3123,37 @@ a.cli-download-primary:hover {
 }
 
 .blog-code-block code {
+  font-size: 12px;
+  line-height: 1.75;
+}
+
+.blog-code-details {
+  margin: 12px 0;
+  border: 1px solid var(--foreground);
+  background: var(--background);
+}
+
+.blog-code-details summary {
+  padding: 14px 16px;
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 750;
+  line-height: 1.5;
+  list-style-position: inside;
+}
+
+.blog-code-details[open] summary {
+  border-bottom: 1px solid var(--soft-border);
+}
+
+.blog-code-details pre {
+  margin: 0;
+  overflow-x: auto;
+  padding: 20px;
+  font: inherit;
+}
+
+.blog-code-details code {
   font-size: 12px;
   line-height: 1.75;
 }
@@ -3406,6 +3691,15 @@ a.cli-download-primary:hover {
     padding-bottom: max(24px, env(safe-area-inset-bottom));
   }
 
+  .workspace-toolbar {
+    gap: 12px;
+    padding: 10px;
+  }
+
+  .workspace-toolbar .workspace-switch {
+    width: auto;
+  }
+
   .site-header {
     grid-template-columns: 96px minmax(0, 1fr);
     gap: 12px;
@@ -3440,10 +3734,6 @@ a.cli-download-primary:hover {
     padding: 10px 12px;
   }
 
-  .header-actions {
-    display: none;
-  }
-
   .brand-illustration {
     width: 100%;
   }
@@ -3458,6 +3748,15 @@ a.cli-download-primary:hover {
     font-size: clamp(24px, 7.2vw, 30px);
     letter-spacing: -0.055em;
     line-height: 1.02;
+  }
+
+  .workspace-switch {
+    display: grid;
+    width: 100%;
+  }
+
+  .workspace-switch button {
+    min-height: 48px;
   }
 
   .transfer-grid {
@@ -3530,6 +3829,34 @@ a.cli-download-primary:hover {
 
   .panel-heading p {
     font-size: 12px;
+  }
+
+  .ssh-panel {
+    padding: 16px;
+  }
+
+  .ssh-heading {
+    grid-template-columns: auto minmax(0, 1fr);
+  }
+
+  .ssh-role {
+    grid-column: 2;
+    justify-self: start;
+  }
+
+  .ssh-join-form,
+  .ssh-actions {
+    grid-template-columns: 1fr;
+  }
+
+  .ssh-join-form > .primary-button {
+    width: 100%;
+    min-height: 48px;
+  }
+
+  .ssh-terminal {
+    min-height: 300px;
+    height: 52vh;
   }
 
   .drop-zone {
@@ -3699,26 +4026,14 @@ a.cli-download-primary:hover {
     grid-template-columns: 88px minmax(0, 1fr);
   }
 
-  .header-actions {
-    position: absolute;
-    bottom: 18px;
-    left: 0;
-    display: grid;
-    grid-template-columns: repeat(2, 44px);
-    gap: 0;
+  .workspace-toolbar .workspace-switch button {
+    min-width: 52px;
+    padding-right: 8px;
+    padding-left: 8px;
   }
 
-  .header-actions > a {
+  .workspace-toolbar .workspace-switch svg {
     display: none;
-  }
-
-  .header-actions .icon-button {
-    width: 44px;
-    height: 44px;
-  }
-
-  .header-actions .theme-toggle {
-    border-left: 0;
   }
 
   .button-pair,
@@ -4112,6 +4427,10 @@ a.cli-download-primary:hover {
   }
 
   .blog-code-block pre {
+    padding: 16px;
+  }
+
+  .blog-code-details pre {
     padding: 16px;
   }
 
