@@ -30,6 +30,10 @@ import (
 
 const (
 	aggregateProgressFileThreshold = 32
+	// maxParallelFileRetries bounds how often a file that fails verification is
+	// requested again. Chunks are authenticated, so a persistent mismatch means
+	// the source changed after it was hashed and resending cannot fix it.
+	maxParallelFileRetries = 2
 )
 
 var hybridChunkJobTargetBytes = int64(64 << 20)
@@ -387,11 +391,10 @@ func (c *Client) prepareRecipientFile(index int) (bool, error) {
 	}
 	relativePath := path.Join(fileInfo.FolderRemote, fileInfo.Name)
 	recipientFileInfo, errRecipientFile := root.Lstat(relativePath)
-	var errHash error
-	var fileHash []byte
-	if errRecipientFile == nil && recipientFileInfo.Size() == fileInfo.Size {
-		fileHash, _, errHash = c.hashReceiverFile(relativePath, c.Options.HashAlgorithm, fileInfo.Hash, !c.Options.SendingText)
+	if errRecipientFile != nil && !os.IsNotExist(errRecipientFile) {
+		return false, errRecipientFile
 	}
+	destinationExists := errRecipientFile == nil
 	if fileInfo.Size == 0 || fileInfo.Symlink != "" {
 		if err := c.createEmptyFileAndFinish(fileInfo, index); err != nil {
 			return false, err
@@ -401,43 +404,35 @@ func (c *Client) prepareRecipientFile(index int) (bool, error) {
 		return false, nil
 	}
 
-	if !bytes.Equal(fileHash, fileInfo.Hash) {
+	// Mirror the sequential receiver: only a regular file can match or be
+	// resumed, and a destination that cannot be hashed is an error rather than
+	// a silent overwrite.
+	destinationRegular := destinationExists && recipientFileInfo.Mode().IsRegular()
+	var fileHash []byte
+	if destinationRegular && recipientFileInfo.Size() == fileInfo.Size {
+		fileHash, _, err = c.hashReceiverFile(relativePath, c.Options.HashAlgorithm, fileInfo.Hash, !c.Options.SendingText)
+		if err != nil {
+			return false, fmt.Errorf("hash existing destination %q: %w", relativePath, err)
+		}
+	}
+
+	if fileHash == nil || !bytes.Equal(fileHash, fileInfo.Hash) {
 		log.Debugf("hashes are not equal %x != %x", fileHash, fileInfo.Hash)
-		if errHash == nil && errRecipientFile == nil &&
-			!strings.HasPrefix(fileInfo.Name, "croc-stdin-") &&
-			!c.Options.SendingText && c.Options.Rename {
+		isTextArtifact := c.Options.SendingText && strings.HasPrefix(path.Base(fileInfo.Name), "croc-stdin-")
+		if destinationExists && !isTextArtifact && c.Options.Rename {
 			newName := utils.UnusedFilename(fileInfo.FolderRemote, fileInfo.Name)
 			output, colorEnabled := termui.Output(os.Stderr)
 			fmt.Fprintf(output, "Receiving %s as %s\n", quotedFilename(fileInfo.Name, colorEnabled), quotedFilename(newName, colorEnabled))
 			c.FilesToTransfer[index].Name = newName
 			fileInfo.Name = newName
+			destinationExists = false
 		}
-		if errHash == nil && !c.Options.Overwrite && !c.Options.Rename &&
-			errRecipientFile == nil && !strings.HasPrefix(fileInfo.Name, "croc-stdin-") &&
-			!c.Options.SendingText {
-			missingRanges := utils.MissingChunks(relativePath, fileInfo.Size, models.TCP_BUFFER_SIZE/2)
-			missingBytes := utils.ChunkRangesBytes(missingRanges, fileInfo.Size, models.TCP_BUFFER_SIZE/2)
-			percentDone := 100 - float64(missingBytes)/float64(fileInfo.Size)*100
-			action := "Overwrite"
-			promptDetail := ""
-			promptSpacing := " "
-			if percentDone < 99 {
-				action = "Resume"
-				promptDetail = fmt.Sprintf(" (%2.1f%%)", percentDone)
-				promptSpacing = "   "
+		if destinationExists && !c.Options.Overwrite && !c.Options.Rename && !isTextArtifact {
+			overwrite, promptErr := askReceiveOverwrite(c.clientContext(), fileInfo, destinationRegular)
+			if promptErr != nil {
+				return false, promptErr
 			}
-			output, colorEnabled := termui.Output(os.Stderr)
-			styledAction := termui.Warning(action, colorEnabled)
-			if action == "Resume" {
-				styledAction = action
-			}
-			fmt.Fprintf(output, "\n%s %s%s? %s%s(use --overwrite to omit) ",
-				styledAction, quotedFilename(relativePath, colorEnabled), promptDetail,
-				termui.PromptChoices("(y/N)", colorEnabled), promptSpacing)
-			choice, _ := utils.GetInput("")
-			choice = strings.ToLower(choice)
-			if choice != "y" && choice != "yes" {
-				fmt.Fprintf(output, "Skipping %s\n", quotedFilename(relativePath, colorEnabled))
+			if !overwrite {
 				c.markFileFinished(index)
 				return false, nil
 			}
@@ -453,9 +448,6 @@ func (c *Client) prepareRecipientFile(index int) (bool, error) {
 		c.rememberVerifiedReceiverFile(relativePath, c.Options.HashAlgorithm, fileInfo.Hash)
 		c.markFileFinished(index)
 		return false, nil
-	}
-	if errHash != nil {
-		log.Debug(errHash)
 	}
 	c.numberOfTransferredFiles++
 	newFolder, _ := filepath.Split(fileInfo.FolderRemote)
@@ -686,12 +678,13 @@ func (c *Client) startParallelReceiverFile(connectionIndex int) error {
 	if !ok {
 		return c.finishParallelReceiverIfDone()
 	}
-	state, err := c.recipientInitializeFileState(index)
+	state, err := c.recipientOpenFileState(index, !c.parallelFileRetried(index))
 	if err != nil {
 		return err
 	}
 	state.bar = c.makeFileBar(index, state.chunkRanges)
 	state.dataConnectionIndex = connectionIndex
+	state.receivedPositions = make(map[int64]struct{})
 	c.fileTransferMu.Lock()
 	if _, busy := c.receiveTransfers[connectionIndex]; busy {
 		c.fileTransferMu.Unlock()
@@ -716,6 +709,34 @@ func (c *Client) startParallelReceiverFile(connectionIndex int) error {
 	}
 	log.Debugf("requesting file %d on data connection %d with %d chunks", index, connectionIndex, state.chunkCount)
 	return c.sendControl(message.Message{Type: message.TypeRecipientReady, Bytes: request})
+}
+
+func (c *Client) parallelFileRetried(fileIndex int) bool {
+	c.fileTransferMu.Lock()
+	defer c.fileTransferMu.Unlock()
+	return c.parallelFileRetries[fileIndex] > 0
+}
+
+// recordParallelFileRetry counts a failed verification of fileIndex. Once the
+// file has been retried maxParallelFileRetries times it tells the peer and
+// returns an error instead of requesting the file forever.
+func (c *Client) recordParallelFileRetry(fileIndex int) error {
+	c.fileTransferMu.Lock()
+	if c.parallelFileRetries == nil {
+		c.parallelFileRetries = make(map[int]int)
+	}
+	c.parallelFileRetries[fileIndex]++
+	failures := c.parallelFileRetries[fileIndex]
+	c.fileTransferMu.Unlock()
+	if failures <= maxParallelFileRetries {
+		return nil
+	}
+	err := fmt.Errorf("%s failed verification %d times; the source file may have changed during the transfer",
+		c.FilesToTransfer[fileIndex].Name, failures)
+	if sendErr := c.sendControl(message.Message{Type: message.TypeError, Message: err.Error()}); sendErr != nil {
+		log.Debugf("sending verification failure: %v", sendErr)
+	}
+	return err
 }
 
 func (c *Client) finishParallelReceiverIfDone() error {
@@ -766,6 +787,23 @@ func hashOpenFile(file *os.File, size int64, algorithm string) ([]byte, error) {
 	}
 }
 
+// checkLaneChunk rejects a chunk the lane did not request, so a stray or
+// repeated frame can never count toward completing the lane.
+func checkLaneChunk(state *fileTransferState, fileSize, position int64, payload []byte) error {
+	chunkSize := int64(models.TCP_BUFFER_SIZE / 2)
+	if position < 0 || position >= fileSize || position%chunkSize != 0 ||
+		!utils.ChunkRangesContain(state.chunkRanges, position) {
+		return fmt.Errorf("invalid data range for file %d: offset %d, length %d", state.fileIndex, position, len(payload))
+	}
+	if expectedBytes := min(chunkSize, fileSize-position); int64(len(payload)) != expectedBytes {
+		return fmt.Errorf("invalid chunk length for file %d at %d: %d != %d", state.fileIndex, position, len(payload), expectedBytes)
+	}
+	if _, duplicate := state.receivedPositions[position]; duplicate {
+		return fmt.Errorf("duplicate chunk for file %d at %d", state.fileIndex, position)
+	}
+	return nil
+}
+
 func (c *Client) receiveParallelData(state *fileTransferState, data []byte) (bool, error) {
 	if state == nil {
 		return false, fmt.Errorf("received data on an idle parallel-file connection")
@@ -783,14 +821,18 @@ func (c *Client) receiveParallelData(state *fileTransferState, data []byte) (boo
 	}
 	position := int64(binary.LittleEndian.Uint64(data[:8]))
 	fileSize := c.FilesToTransfer[state.fileIndex].Size
-	if position < 0 || position > fileSize || int64(len(data[8:])) > fileSize-position {
+	if err := checkLaneChunk(state, fileSize, position, data[8:]); err != nil {
 		state.mu.Unlock()
-		return false, fmt.Errorf("invalid data range for file %d: offset %d, length %d", state.fileIndex, position, len(data[8:]))
+		return false, err
 	}
 	if _, err := state.file.WriteAt(data[8:], position); err != nil {
 		state.mu.Unlock()
 		return false, err
 	}
+	if state.receivedPositions == nil {
+		state.receivedPositions = make(map[int64]struct{})
+	}
+	state.receivedPositions[position] = struct{}{}
 	state.totalSent += int64(len(data[8:]))
 	state.totalChunks++
 	if state.verifier != nil {
@@ -866,24 +908,9 @@ func (c *Client) receiveHybridParallelData(state *fileTransferState, data []byte
 	position := int64(binary.LittleEndian.Uint64(data[:8]))
 	payload := data[8:]
 	fileSize := c.FilesToTransfer[state.fileIndex].Size
-	chunkSize := int64(models.TCP_BUFFER_SIZE / 2)
-	if position < 0 || position >= fileSize || position%chunkSize != 0 ||
-		int64(len(payload)) > fileSize-position ||
-		!utils.ChunkRangesContain(state.chunkRanges, position) {
+	if err := checkLaneChunk(state, fileSize, position, payload); err != nil {
 		state.mu.Unlock()
-		return false, fmt.Errorf("invalid hybrid data range for file %d: offset %d, length %d", state.fileIndex, position, len(payload))
-	}
-	expectedBytes := chunkSize
-	if remaining := fileSize - position; remaining < expectedBytes {
-		expectedBytes = remaining
-	}
-	if int64(len(payload)) != expectedBytes {
-		state.mu.Unlock()
-		return false, fmt.Errorf("invalid hybrid chunk length for file %d at %d: %d != %d", state.fileIndex, position, len(payload), expectedBytes)
-	}
-	if _, duplicate := state.receivedPositions[position]; duplicate {
-		state.mu.Unlock()
-		return false, fmt.Errorf("duplicate hybrid chunk for file %d at %d", state.fileIndex, position)
+		return false, err
 	}
 	if _, err := state.receiveFile.file.WriteAt(payload, position); err != nil {
 		state.mu.Unlock()
@@ -1028,6 +1055,9 @@ func (c *Client) finishParallelReceiverFile(m message.Message) error {
 	retry := state.retry
 	state.mu.Unlock()
 	if retry {
+		if err := c.recordParallelFileRetry(fileIndex); err != nil {
+			return err
+		}
 		c.fileQueue.push(fileIndex)
 	}
 	return c.startParallelReceiverFile(state.dataConnectionIndex)
@@ -1066,6 +1096,9 @@ func (c *Client) finishHybridReceiverLane(ack parallelFileLaneAck) error {
 			delete(c.receiveFileStates, ack.FileIndex)
 			c.fileTransferMu.Unlock()
 		} else if retry {
+			if err := c.recordParallelFileRetry(ack.FileIndex); err != nil {
+				return err
+			}
 			if err := c.queueHybridFileRetry(fileState); err != nil {
 				return err
 			}
@@ -1219,7 +1252,24 @@ func (c *Client) sendParallelFileData(state *fileTransferState, dataConn *comm.C
 		if err := c.ctxErr(); err != nil {
 			return false
 		}
-		n, readErr := state.file.ReadAt(payload[8:], position)
+		expectedBytes := min(chunkSize, fileSize-position)
+		n, readErr := state.file.ReadAt(payload[8:8+expectedBytes], position)
+		if int64(n) < expectedBytes {
+			// The receiver counts chunks, so skipping a short read would stall
+			// the transfer; the source must have shrunk after it was hashed.
+			err := fmt.Errorf("%s changed during the transfer: read %d of %d bytes at offset %d",
+				c.FilesToTransfer[state.fileIndex].Name, n, expectedBytes, position)
+			// Only the generic message reaches the peer; a read error may name
+			// local paths.
+			if sendErr := c.sendControl(message.Message{Type: message.TypeError, Message: err.Error()}); sendErr != nil {
+				log.Debugf("sending read failure: %v", sendErr)
+			}
+			if readErr != nil && readErr != io.EOF {
+				err = readErr
+			}
+			attempt.report(err)
+			return false
+		}
 		if c.limiter != nil && n > 0 {
 			reservation := c.limiter.ReserveN(time.Now(), n)
 			time.Sleep(reservation.Delay())

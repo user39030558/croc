@@ -292,6 +292,7 @@ type Client struct {
 	parallelFilesInitialized bool
 	receiveTransfers         map[int]*fileTransferState
 	receiveFileStates        map[int]*parallelReceiveFileState
+	parallelFileRetries      map[int]int
 	senderTransfers          map[int]*fileTransferState
 	senderAskDone            bool
 	receiveRootMu            sync.Mutex
@@ -549,6 +550,7 @@ func newClient(ops Options, transport tailcatDataTransport) (c *Client, err erro
 	c.FilesHasFinished = make(map[int]struct{})
 	c.receiveTransfers = make(map[int]*fileTransferState)
 	c.receiveFileStates = make(map[int]*parallelReceiveFileState)
+	c.parallelFileRetries = make(map[int]int)
 	c.senderTransfers = make(map[int]*fileTransferState)
 	c.senderProgressFile = make(map[int]struct{})
 
@@ -953,6 +955,7 @@ func (c *Client) resetForReconnectAttempt(attempt int) error {
 	c.parallelFilesInitialized = false
 	c.receiveTransfers = make(map[int]*fileTransferState)
 	c.receiveFileStates = make(map[int]*parallelReceiveFileState)
+	c.parallelFileRetries = make(map[int]int)
 	c.senderTransfers = make(map[int]*fileTransferState)
 	c.fileTransferMu.Unlock()
 	c.fileQueue.reset(nil)
@@ -3432,7 +3435,15 @@ func (c *Client) updateIfSenderChannelSecured() (err error) {
 	return
 }
 
-func (c *Client) recipientInitializeFileState(fileIndex int) (state *fileTransferState, err error) {
+func (c *Client) recipientInitializeFileState(fileIndex int) (*fileTransferState, error) {
+	return c.recipientOpenFileState(fileIndex, true)
+}
+
+// recipientOpenFileState opens the destination for fileIndex. With resume set,
+// an existing full-size file only requests its all-zero chunks; otherwise every
+// chunk is requested, which a retry after a failed verification needs because
+// the corrupt chunks are not necessarily zero.
+func (c *Client) recipientOpenFileState(fileIndex int, resume bool) (state *fileTransferState, err error) {
 	// start initiating the process to receive a new file
 	log.Debugf("working on file %d", fileIndex)
 	if fileIndex < 0 || fileIndex >= len(c.FilesToTransfer) {
@@ -3478,7 +3489,7 @@ func (c *Client) recipientInitializeFileState(fileIndex int) (state *fileTransfe
 			return nil, statErr
 		}
 		truncate = stat.Size() != c.FilesToTransfer[fileIndex].Size
-		if !truncate {
+		if !truncate && resume {
 			// recipient requests the file and chunks (if empty, then should receive all chunks)
 			// TODO: determine the missing chunks
 			state.chunkRanges = utils.MissingChunks(
